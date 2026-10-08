@@ -1,0 +1,46 @@
+# Build output
+/build/
+/build-*/
+/dist/
+*.obj
+*.o
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.lib
+*.exp
+*.pdb
+*.ilk
+
+# Local toolchain (TheRock ROCm venv, ninja) - installed per BUILD.md, not vendored
+/toolchain/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Generated build info (configure writes this from common/build-info.cpp.in)
+/common/build-info.cpp
+
+# Editors / OS
+.vs/
+.vscode/
+.idea/
+*.user
+*.swp
+.DS_Store
+Thumbs.db
+
+# Local scratch
+*.log
+*.tmp
+node_modules/
+
+# NOTE: the release launcher package/content/launcher/strix.bat is tracked on purpose.
+# Do not add a global *.bat rule here; if one is ever needed, negate that path explicitly.

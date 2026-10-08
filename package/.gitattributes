@@ -1,0 +1,6 @@
+# The launcher is a Windows batch script: it MUST have CRLF line endings on every clone,
+# independent of core.autocrlf. Without this, a clone with autocrlf=false (or on a non-Windows
+# checkout) would get LF and cmd.exe can misbehave on some constructs.
+content/launcher/strix.bat text eol=crlf
+content/README.md          text eol=crlf
+*.ps1                      text eol=crlf
