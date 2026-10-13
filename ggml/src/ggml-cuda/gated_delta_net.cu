@@ -742,6 +742,16 @@ static void launch_gated_delta_net(
     }
 }
 
+struct gdn_qk_src { const ggml_tensor * gdn; const void * data; const float * q, * k; int64_t s1, s2, s3; };
+static std::vector<gdn_qk_src> g_gdn_qk;
+
+void ggml_cuda_gdn_qk_from(const ggml_tensor * gdn, const float * q, const float * k, int64_t s1, int64_t s2, int64_t s3) {
+    for (auto it = g_gdn_qk.begin(); it != g_gdn_qk.end(); ++it) {
+        if (it->gdn == gdn) { g_gdn_qk.erase(it); break; }
+    }
+    g_gdn_qk.push_back({gdn, gdn->data, q, k, s1, s2, s3});
+}
+
 static void ggml_cuda_op_gated_delta_net_impl(
         ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_cuda_gated_delta_net_fused_cache * cache) {
     ggml_tensor * src_q     = dst->src[0];
@@ -773,6 +783,10 @@ static void ggml_cuda_op_gated_delta_net_impl(
 
     const float * q_d = (const float *) src_q->data;
     const float * k_d = (const float *) src_k->data;
+    const gdn_qk_src * qk = nullptr;
+    for (const auto & e : g_gdn_qk) {
+        if (e.gdn == dst && e.data == dst->data) { qk = &e; break; }
+    }
     const float * v_d = (const float *) src_v->data;
     const float * g_d = (const float *) src_g->data;
     const float * b_d = (const float *) src_beta->data;
@@ -792,9 +806,14 @@ static void ggml_cuda_op_gated_delta_net_impl(
     GGML_ASSERT(ggml_is_contiguous(src_state));
 
     // strides in floats (beta strides used for both g and beta offset computation)
-    const int64_t sq1 = nbq1 / sizeof(float);
-    const int64_t sq2 = nbq2 / sizeof(float);
-    const int64_t sq3 = nbq3 / sizeof(float);
+    int64_t sq1 = nbq1 / sizeof(float);
+    int64_t sq2 = nbq2 / sizeof(float);
+    int64_t sq3 = nbq3 / sizeof(float);
+    if (qk != nullptr) {   // ggml_cuda_gdn_qk_from: once
+        q_d = qk->q; k_d = qk->k; sq1 = qk->s1; sq2 = qk->s2; sq3 = qk->s3;
+        g_gdn_qk.erase(g_gdn_qk.begin() + (qk - g_gdn_qk.data()));
+        qk = nullptr;
+    }
     const int64_t sv1 = nbv1 / sizeof(float);
     const int64_t sv2 = nbv2 / sizeof(float);
     const int64_t sv3 = nbv3 / sizeof(float);
@@ -1062,6 +1081,35 @@ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor *
         return;
     }
     ggml_cuda_op_gated_delta_net_impl(ctx, dst, nullptr);
+}
+
+#include "ggml-backend-impl.h"
+
+// strixllama: see gated_delta_net.cuh. The stream is drained first: the pool block the info goes to may still be read
+// by the last graph's kernels, and the host copy of the rows that follows runs on another stream
+void ggml_backend_cuda_gdn_replay(ggml_backend_t backend, int n_layer, ggml_tensor ** states, ggml_tensor ** recs,
+                                  int32_t row, int32_t n_rep, int32_t first, int S_v, int H_v, int H_k) {
+    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(ctx->device);
+    cudaStream_t stream = ctx->stream();
+    const int warp_size = ggml_cuda_info().devices[ctx->device].warp_size;
+    GGML_ASSERT(S_v == 128 && (warp_size == 32 || warp_size == 64));
+    const bool two = warp_size == 32;
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    ggml_cuda_pool_alloc<int32_t> info(ctx->pool(), 5);
+    const int32_t h_info[5] = { row, row, n_rep, first, first };
+    CUDA_CHECK(cudaMemcpy(info.get(), h_info, sizeof(h_info), cudaMemcpyHostToDevice));
+    const dim3 grid(H_v, 1, S_v / 4 / (two ? 2 : 1));
+    const dim3 block(warp_size, 4, 1);
+    const ggml_cuda_kernel_launch_params params(grid, block, 0, stream);
+    for (int il = 0; il < n_layer; ++il) {
+        ggml_cuda_kernel_launch(two ? gated_delta_net_lazy_cuda<128, true, 2> : gated_delta_net_lazy_cuda<128, true, 1>, params,
+            nullptr, nullptr, nullptr, nullptr, nullptr, (float *) states[il]->data, (float *) recs[il]->data,
+            (const int32_t *) info.get(), nullptr, (int64_t) H_v, (int64_t) H_k, (int64_t) 0, (int64_t) 0, (int64_t) 0,
+            (int64_t) 0, (int64_t) 0, (int64_t) 0, (int64_t) 0, (int64_t) 0, (int64_t) 0, (int64_t) 0,
+            init_fastdiv_values(1), 1.0f, (int64_t) recs[il]->ne[0], (int64_t) recs[il]->ne[1]);
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
 }
 
 void ggml_cuda_op_gated_delta_net_fused_cache(

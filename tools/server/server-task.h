@@ -95,6 +95,11 @@ struct task_params {
     std::string        oaicompat_model;
     std::string        oaicompat_cmpl_id;
 
+    // strixllama: OpenAI Responses tools offered to the model under another form (custom tools as functions taking one
+    // string "input", namespace tools as plain functions), keyed by the name the model was shown:
+    // {"type": "custom"|"function", "name": ..., "namespace": ...}; null when every tool is a plain function
+    std::shared_ptr<const json> resp_tools;
+
     // realtime control (SERVER_TASK_TYPE_CONTROL)
     std::string        control_action;
     std::string        control_cmpl_id;
@@ -104,6 +109,9 @@ struct task_params {
 
     // message spans for checkpointing
     common_chat_msg_spans message_spans;
+    // strixllama: the delimiters they were found with, to find them again when the prompt's tokens change
+    // (server_context_impl::splice_own_tokens)
+    std::shared_ptr<const common_chat_msg_delimiters> message_delims;
 
     // Embeddings
     int32_t embd_normalize = 2; // (-1=none, 0=max absolute int16, 1=taxicab, 2=Euclidean/L2, >2=p-norm)
@@ -133,6 +141,8 @@ struct task_result_state {
     const std::string oai_resp_reasoning_id;
     const std::string oai_resp_message_id;
     std::string oai_resp_fc_id; // function call ID for current args delta
+    bool oai_resp_fc_custom = false; // strixllama: the current call is of a custom tool (its events wait for the end)
+    std::shared_ptr<const json> resp_tools; // strixllama: task_params::resp_tools
 
     task_result_state(const common_chat_parser_params & chat_parser_params);
 
@@ -268,7 +278,9 @@ struct server_task {
     // the task will be moved into queue, then onto slots
     // however, the state must be kept by caller (e.g., HTTP thread)
     task_result_state create_state() const {
-        return task_result_state(params.chat_parser_params);
+        task_result_state state(params.chat_parser_params);
+        state.resp_tools = params.resp_tools;
+        return state;
     }
 
     bool is_parent() const {
@@ -376,6 +388,7 @@ struct server_task_result_cmpl_final : server_task_result {
     std::string oai_resp_id;
     std::string oai_resp_reasoning_id;
     std::string oai_resp_message_id;
+    std::shared_ptr<const json> resp_tools; // strixllama: task_params::resp_tools
 
     virtual bool is_stop() override {
         return true; // in stream mode, final responses are considered stop
@@ -390,6 +403,7 @@ struct server_task_result_cmpl_final : server_task_result {
         oai_resp_id = state.oai_resp_id;
         oai_resp_reasoning_id = state.oai_resp_reasoning_id;
         oai_resp_message_id = state.oai_resp_message_id;
+        resp_tools = state.resp_tools;
     }
 
     json to_json_non_oaicompat();
@@ -447,6 +461,8 @@ struct server_task_result_cmpl_partial : server_task_result {
     std::string oai_resp_reasoning_id;
     std::string oai_resp_message_id;
     std::string oai_resp_fc_id;
+    bool oai_resp_fc_custom = false;        // strixllama: task_result_state::oai_resp_fc_custom
+    std::shared_ptr<const json> resp_tools; // strixllama: task_params::resp_tools
 
     // for Anthropic API: track if any reasoning content has been generated
     bool anthropic_has_reasoning = false;

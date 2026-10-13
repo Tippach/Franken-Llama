@@ -1672,6 +1672,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
             // graph of a conversation, one after a restore or a rewind - then selects what the cache would have
             pooled = ggml_get_rows(ctx0, kb, inp->kb_bid_rows);
             pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, n_blocks, n_stream);
+        } else {
+            // without the cache - switched off, several streams, an image ubatch, or any text after an image
+            // (kb_pos_dup) - the keys are rounded to F16 too: the block choice, and the text, came out different from
+            // a fresh server's once the server had seen one image (issue #16)
+            pooled = ggml_cast(ctx0, ggml_cast(ctx0, pooled, GGML_TYPE_F16), GGML_TYPE_F32);
         }
     }
     cb(pooled, "indexer_k", il);
@@ -2247,14 +2252,19 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     ggml_tensor * qkv_mixed = qkvz.first;
     ggml_tensor * z         = qkvz.second;
 
-    ggml_tensor * beta = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s);
+    ggml_tensor * beta  = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s);
+    ggml_tensor * alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
+    // strixllama: the two narrow projections of the same input side by side in the graph, which ggml-cuda then runs as
+    // one pass over the input for a prompt-sized batch (the narrow pair, ggml_cuda_mmb_f32_narrow_pair). Graph order only
+    ggml_build_forward_expand(gf, beta);
+    ggml_build_forward_expand(gf, alpha);
+
     beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs_tok);
     cb(beta, "beta", il);
 
     beta = ggml_sigmoid(ctx0, beta);
     cb(beta, "beta_sigmoid", il);
 
-    ggml_tensor * alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
     alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs_tok);
     cb(alpha, "alpha", il);
 
@@ -2357,6 +2367,19 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
 
         q_conv = build_gdn_l2_norm(ctx0, q_conv, eps_norm);
         k_conv = build_gdn_l2_norm(ctx0, k_conv, eps_norm);
+
+        // strixllama: ggml-cuda runs the conv - and these two norms - straight from x_g and the gathered state rows at the
+        // conv's node (gdn-conv.cu), and the allocator frees both after the concat, the last node reading them: the SiLU's
+        // output could land on them while that pass reads them. The norms' outputs take the state rows (3 x channels) as
+        // an extra source, which no backend reads and which keeps them allocated past the SiLU's. x_g kept too raised the
+        // compute buffer by 50 MB: gdn-conv.cu copies the halos when the SiLU's output is x_g's block, and falls back when
+        // it is elsewhere on it
+        if (q_conv->op == GGML_OP_SCALE && k_conv->op == GGML_OP_SCALE && conv_input->op == GGML_OP_CONCAT) {
+            for (ggml_tensor * t : { q_conv, k_conv }) {
+                GGML_ASSERT(t->src[1] == nullptr);
+                t->src[1] = conv_input->src[0];
+            }
+        }
 
         // repeat to match shapes when head keys != value keys; unneeded with the fused GDN (and the deferred-rollback
         // net)

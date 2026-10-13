@@ -155,7 +155,9 @@ static __device__ __forceinline__ float idxd_partial(const half2 k, const float 
 // one wave's butterfly sum of its 32 partials: k and q hold that wave's 64 dims
 static __device__ __forceinline__ float idxd_wave(const half2 * __restrict__ k, const float * __restrict__ q) {
     float a[16];
-#pragma unroll
+    // strixllama: unroll 4, not all 16. The a[i] are independent, so this reorders nothing and the scores are the same
+    // bits, but the compiler no longer keeps a whole wave's worth of q live beside k[32] and a[16].
+#pragma unroll 4
     for (int i = 0; i < 16; ++i) {
         a[i] = idxd_partial(k[i], q + 2 * i) + idxd_partial(k[i + 16], q + 2 * (i + 16));
     }
@@ -267,6 +269,13 @@ static __global__ void __launch_bounds__(256) k_idx_score_dec(const half * __res
 // on 16 different even banks. The arithmetic is k_idx_score_dec's, so the scores are the same bits.
 #define IDXD3_TS 132
 #define IDXD3_HS (IDXD_MAXQ * IDXD3_TS)
+// strixllama: at the decode shape (one query) this kernel measured 381 us a layer over 16.8 MB of block keys - 44 GB/s,
+// where the big GEMVs on this box reach ~200 - and the codegen report says why: 256 VGPRs with 156 bytes a lane SPILLED
+// to scratch, which at 262K is ~20 MB written and read back a layer (more traffic than the keys themselves) and caps the
+// CU at one resident block. Forcing a lower register target with __launch_bounds__(256, n) only moved more values to
+// scratch (spill 156 -> 199 at n=8), so the pressure is structural: idxd_wave's fully unrolled first loop lets the
+// compiler keep a whole wave's worth of q live beside k[32] and a[16]. Unrolling that loop 4 at a time (see idxd_wave)
+// is what relieves it. The a[i] are independent, so no addition order changes and the scores stay the same bits.
 static __global__ void __launch_bounds__(256) k_idx_score_dec3(const half * __restrict__ kb, const int64_t kbs,
         const int32_t * __restrict__ rows, const int nb, const float * __restrict__ q, const int64_t qs, const int nq,
         const int32_t * __restrict__ starts, const int32_t * __restrict__ tails, float * __restrict__ out, const float zero,

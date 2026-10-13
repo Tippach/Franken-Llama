@@ -152,8 +152,12 @@ if ($bat -notmatch 'set "MTP=unsloth/Qwen3\.8-Flash-Next-GGUF"') { Fail 'bat doe
 if ($bat -notmatch 'MTP_FILE=MTP/mtp-Qwen3\.8-Flash-Next-shared-Q4_K_M\.gguf') { Fail 'bat does not name the shared draft file' }
 if ($bat -notmatch '--spec-draft-vocab-latin') { Fail 'bat does not enforce the trim' }
 if ($bat -match '\\draft\\') { Fail 'bat references a bundled draft\ path' }
-# KV chain is ON by default now (prefix hits survive a restart on this UMA box)
-if ($bat -notmatch '(?m)^\s*if not defined KVCHAIN set "KVCHAIN=1"') { Fail 'bat does not default KVCHAIN=1' }
+# exactly ONE prompt-cache-on-disk mechanism, default kv-chain (handles text AND image chats;
+# prefix hits survive a restart on this UMA box). The old KVCHAIN=0/1 switch is still mapped.
+if ($bat -notmatch '(?m)^\s*if not defined CACHE set "CACHE=kvchain"') { Fail 'bat does not default CACHE=kvchain' }
+if ($bat -notmatch '--kv-chain-dir') { Fail 'bat kvchain arm does not emit --kv-chain-dir' }
+if ($bat -notmatch '--cache-disk-dir') { Fail 'bat disk arm does not emit --cache-disk-dir' }
+if ($bat -notmatch 'owner\.txt') { Fail 'bat has no owner.txt stamp (shared-dir wipe-on-flip)' }
 # YaRN must be a real knob (default off, scale 2) and must actually emit the rope flags
 if ($bat -notmatch '(?m)^\s*if not defined YARN set "YARN=0"') { Fail 'bat has no YARN knob defaulting to 0' }
 if ($bat -notmatch '(?m)^\s*if not defined YARN_SCALE set "YARN_SCALE=2"') { Fail 'bat has no YARN_SCALE defaulting to 2' }

@@ -178,6 +178,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
 
     // skip device enumeration so the CUDA primary context stays uncreated
     common_params_print_info(params, !is_router_server);
+    SRV_INF("Rulith Inference engine, build %s - https://github.com/rulith-dev/rulith-inference\n", llama_build_info());
 
     if (!is_router_server) {
         // validate batch size for embeddings
@@ -327,6 +328,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
     ctx_http.post("/slots/:id_slot",           ex_wrapper(routes.post_slots));
     // strixllama: the manager asks for this before it stops the server - conversations leave memory then
     ctx_http.post("/strix/persist",            ex_wrapper(routes.post_strix_persist));
+    ctx_http.post("/strix/spec",               ex_wrapper(routes.post_strix_spec));
 
     // resumable streaming: a child binds the local session factories, the router binds
     // proxies that resolve the owning child, see server-stream.h

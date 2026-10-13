@@ -639,6 +639,11 @@ struct common_params {
     int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
+    // strixllama: disk tier under the prompt cache (was env-only STRIX_PROMPT_CACHE_DIR/_MIB for
+    // tools/manager.py); --cache-disk-dir turns it on. Mutually exclusive with kv_chain_dir - the
+    // launchers pick ONE prompt-state-on-disk mechanism (kv-chain for vision, this otherwise).
+    std::string prompt_cache_disk_dir = "";  // disk prompt cache dir (empty = disabled)
+    int32_t prompt_cache_disk_mib     = 16384;  // max total size of the disk prompt cache, in MiB
     std::string kv_chain_dir    = "";    // disk-backed hash-chain KV cache dir (empty = disabled)
     int32_t kv_chain_limit_gb   = 16;    // max total size of the hash-chain KV cache, in GiB (0 = no limit)
     int32_t kv_chain_tail_stride = 1;    // write the last-write-wins recurrent tail slice every N chunks (+ last chunk of a prompt); 1 = every chunk

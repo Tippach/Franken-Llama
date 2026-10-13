@@ -1960,7 +1960,8 @@ static bool ggml_cuda_small_k(ggml_backend_cuda_context & ctx, const ggml_tensor
     return true;
 }
 
-static bool ggml_cuda_skinny_f32(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+// strixllama: whether ggml_cuda_skinny_f32 takes this product (and, with narrow, whether it hands it to the narrow WMMA kernel)
+static bool ggml_cuda_skinny_f32_ok(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, bool * narrow) {
     static const bool on = !getenv("STRIX_SKINNY_F32") || atoi(getenv("STRIX_SKINNY_F32")) != 0;
     const int64_t K = src0->ne[0], M = src0->ne[1], T = src1->ne[1];
     if (!on || src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
@@ -1971,7 +1972,17 @@ static bool ggml_cuda_skinny_f32(ggml_backend_cuda_context & ctx, const ggml_ten
             ggml_cuda_info().devices[ctx.device].warp_size != 32) {
         return false;
     }
-    if (M > 8 || (M != 1 && M != 2 && M != 4 && M != 8)) {
+    if (narrow) { *narrow = M > 8 || (M != 1 && M != 2 && M != 4 && M != 8); }
+    return true;
+}
+
+static bool ggml_cuda_skinny_f32(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    bool narrow = false;
+    if (!ggml_cuda_skinny_f32_ok(ctx, src0, src1, dst, &narrow)) {
+        return false;
+    }
+    const int64_t K = src0->ne[0], M = src0->ne[1], T = src1->ne[1];
+    if (narrow) {
         return ggml_cuda_mmb_f32_narrow(ctx, src0, src1, dst);
     }
     const int64_t sw = src0->nb[1] / sizeof(float), sx = src1->nb[1] / sizeof(float), sd = dst->nb[1] / sizeof(float);
@@ -2402,12 +2413,32 @@ static int strix_repeat(const char * key) {
     return at == std::string::npos ? 0 : atoi(spec.c_str() + at + k.size());
 }
 
-// strixllama DEV: STRIX_REPEAT_FILE=<path>, the in-graph cost of any op class by repetition, changeable while the server
-// runs. The file holds items OP[:SUB][@lo[-hi]][/K]=N, separated by commas, semicolons or newlines: OP a ggml op name or
-// *, SUB a unary or glu op name, lo-hi the node's ne[0], K its src[0]'s ne[0] (e.g. MUL_MAT@10240/320=2 is the
-// hyper-connections' up product). A matching node - a fused chain by its first node - is dispatched N more times, so a
-// step grows by N times the class's cost. Only nodes whose output overlaps none of their inputs repeat (each repeat
-// writes what the node wrote), never the ops that write beyond their output (cache and state writes); a chain repeats
+    // strixllama DEV: STRIX_TOPK_CENSUS=1 records every TOP_K that is actually dispatched and dumps the
+    // distinct (ncols, nrows, k) cells with their counts at exit. A top-k threshold sweep is worthless
+    // without knowing which cells the model emits, and upstream's grid is measured on NVIDIA parts.
+    // Zero cost when unset (one static bool per dispatch). Output goes to stderr like every other probe.
+    static void strixllama_topk_census(const ggml_tensor * src0, const ggml_tensor * dst) {
+        static const bool on = getenv("STRIX_TOPK_CENSUS") != nullptr;
+        if (!on) { return; }
+        // key = {ncols, nrows, k}; count = how many times that exact cell was dispatched
+        static std::map<std::array<long long, 3>, long long> cells;
+        static std::once_flag atexit_hook;
+        std::call_once(atexit_hook, []() {
+            std::atexit([]() {
+                long long total = 0;
+                for (const auto & kv : cells) { total += kv.second; }
+                fprintf(stderr, "TOPK_CENSUS: %lld dispatches over %zu distinct cells\n", total, cells.size());
+                // widest rows first - those are the cells a threshold decision turns on
+                std::vector<std::pair<std::array<long long, 3>, long long>> v(cells.begin(), cells.end());
+                std::sort(v.begin(), v.end(), [](const auto & a, const auto & b) { return a.first[0] > b.first[0]; });
+                for (const auto & kv : v) {
+                    fprintf(stderr, "  x%-7lld ncols=%-9lld nrows=%-8lld k=%lld\n",
+                            kv.second, kv.first[0], kv.first[1], kv.first[2]);
+                }
+            });
+        });
+        cells[{ src0->ne[0], ggml_nrows(src0), dst->ne[0] }]++;
+    }
 // only if all of its nodes qualify. The item `dump` lists every dispatched class of the next graphs with its count. The
 // file is read again when its content changes (checked at most five times a second), and the HIP graphs are captured
 // again then.
@@ -3094,6 +3125,7 @@ bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tens
             ggml_cuda_op_ssm_scan(ctx, dst);
             break;
         case GGML_OP_TOP_K:
+            strixllama_topk_census(dst->src[0], dst);
             ggml_cuda_op_top_k(ctx, dst);
             if (dst->ne[0] == 512) {
                 for (int r = strix_repeat("topk"); r > 0; --r) { ggml_cuda_op_top_k(ctx, dst); }
@@ -5241,6 +5273,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         ggml_cuda_norm_gated_match nm;
         int sk = ggml_cuda_norm_gated_match_at(cgraph, i, nm);
         if (sk > 0) {
+            // strixllama: the gate GEMM's only reader is this norm - run them as one kernel, z never written (mmb.cu)
+            if (nm.pre >= 0 && ggml_node_has_n_uses(cgraph, nm.pre, 1) && (nm.z == cgraph->nodes[nm.pre] || nm.z->view_src == cgraph->nodes[nm.pre]) &&
+                    ggml_cuda_mmb_gemm_gnorm(*cuda_ctx, cgraph->nodes[nm.pre], nm.x, nm.w, nm.eps, nm.dst)) {
+                return sk;
+            }
             if (nm.pre >= 0) { if (!ggml_cuda_compute_forward(*cuda_ctx, cgraph->nodes[nm.pre])) { GGML_ABORT("norm-gated: gate MUL_MAT dispatch failed"); } }
             ggml_cuda_op_norm_gated(*cuda_ctx, nm); return sk;
         }
@@ -5256,7 +5293,29 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             return 1;
         }
         if (node->op == GGML_OP_SSM_CONV && ggml_cuda_gdn_conv_match_at_conv(cgraph, i, gm)) {
+            // strixllama: with the q and k norms after it in the same pass (STRIX_GDN_CONV_NORM=0: off)
+            ggml_cuda_gdn_conv_norm gn;
+            if (ggml_cuda_gdn_conv_norm_match(cgraph, gm, gn)) {
+                ggml_cuda_gdn_conv_norm_run(*cuda_ctx, gm, gn);
+                return gn.last - i;
+            }
             ggml_cuda_gdn_conv_direct(*cuda_ctx, gm);
+            return 1;
+        }
+    }
+
+    // strixllama: two narrow F32 products of the same activations next to each other (the GDN beta and alpha, which
+    // qwen4exp puts side by side) in one pass over them - only where each would have gone to the narrow kernel on its
+    // own, whose results these are bitwise. The second's output is not read or written between the two nodes
+    if (node->op == GGML_OP_MUL_MAT && i + 1 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_MUL_MAT &&
+            cgraph->nodes[i + 1]->src[1] == node->src[1] && node->src[0]->type == GGML_TYPE_F32 && cgraph->nodes[i + 1]->src[0]->type == GGML_TYPE_F32) {
+        ggml_tensor * nx = cgraph->nodes[i + 1];
+        bool n0 = false, n1 = false;
+        if (ggml_get_op_params_i32(node, 1) != GGML_HINT_SRC0_IS_HADAMARD && ggml_get_op_params_i32(nx, 1) != GGML_HINT_SRC0_IS_HADAMARD &&
+                g_hc_inject.node != node && g_hc_inject.node != nx &&
+                ggml_cuda_skinny_f32_ok(*cuda_ctx, node->src[0], node->src[1], node, &n0) && n0 &&
+                ggml_cuda_skinny_f32_ok(*cuda_ctx, nx->src[0], nx->src[1], nx, &n1) && n1 &&
+                ggml_cuda_mmb_f32_narrow_pair(*cuda_ctx, node->src[0], nx->src[0], node->src[1], node, nx)) {
             return 1;
         }
     }
@@ -6527,8 +6586,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     const size_t n_list = (size_t) atoi(getenv("STRIX_NODE_TIMING_LIST"));
                     for (size_t k = 0; k < rows.size() && k < n_list; ++k) {
                         const ggml_tensor * t = cgraph->nodes[rows[k].node];
-                        fprintf(stderr, "  LIST %4zu n%-5d %8.3f ms %-14s %-28s [%lld,%lld,%lld,%lld] %s\n", k, rows[k].node, rows[k].ms, ggml_op_name(t->op), t->name,
-                                (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3], ggml_type_name(t->type));
+                        const ggml_tensor * s0 = t->src[0];
+                        fprintf(stderr, "  LIST %4zu n%-5d %8.3f ms %-14s %-28s [%lld,%lld,%lld,%lld] %s src0 %s [%lld,%lld,%lld,%lld] %s\n", k, rows[k].node, rows[k].ms, ggml_op_name(t->op), t->name,
+                                (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3], ggml_type_name(t->type),
+                                s0 ? s0->name : "-", s0 ? (long long) s0->ne[0] : 0LL, s0 ? (long long) s0->ne[1] : 0LL, s0 ? (long long) s0->ne[2] : 0LL,
+                                s0 ? (long long) s0->ne[3] : 0LL, s0 ? ggml_type_name(s0->type) : "-");
                     }
                 }
                 std::sort(rows.begin(), rows.end(), [](const row & a, const row & b) { return a.ms > b.ms; });
@@ -6916,6 +6978,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         for (int i = 0; i < cgraph->n_nodes; ++i) {
             const ggml_tensor * t = cgraph->nodes[i];
             if (t->op == GGML_OP_MUL_MAT && (t->src[0]->type == GGML_TYPE_IQ4_NL || t->src[0]->type == GGML_TYPE_Q6_K) && ggml_cuda_mmb_supported_mm(t->src[0], t->src[1], t)) ggml_cuda_mmb_shadow_prepare(*cuda_ctx, t->src[0]);
+            if (t->op == GGML_OP_MUL_MAT && t->src[0]->type == GGML_TYPE_F32 && t->src[0]->ne[1] <= 64 && t->src[1]->ne[1] > 64) ggml_cuda_mmb_f16w_prepare(*cuda_ctx, t->src[0]);
         }
     }
     if (ggml_cuda_mmb_down16()) {
@@ -8057,11 +8120,13 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_SUM:
             return ggml_is_contiguous_rows(op->src[0]);
         case GGML_OP_TOP_K:
-#if defined(GGML_USE_HIP) || defined(GGML_CUDA_USE_CUB)
-            return true;
-#else
-            return op->src[0]->ne[0] <= 1024;
-#endif // defined(GGML_USE_HIP) || defined(GGML_CUDA_USE_CUB)
+            // strixllama: upstream #28713 (71ad059). ggml_cuda_op_top_k truncates ne[0] to int when it
+            // dispatches, so claiming support for a wider row silently wraps it instead of falling back to
+            // CPU. Inert on every reachable shape (a row over INT_MAX columns is >8 GiB of f32); the point
+            // is that the truncation cannot be silent. Our HIP build defines neither GGML_CUDA_USE_CUB nor
+            // CUB_TOP_K_AVAILABLE, so the CUDA-only threshold logic of that PR is dead here - only this cap
+            // transfers. ARGSORT below is already capped tighter (1024) on the compiled path.
+            return op->src[0]->ne[0] <= INT_MAX;
         case GGML_OP_ARGSORT:
 #ifndef GGML_CUDA_USE_CUB
             return op->src[0]->ne[0] <= 1024;
@@ -8298,6 +8363,10 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     // strixllama DEV: the side of the in-run A/B (STRIX_AB), for switches outside the backend
     if (strcmp(name, "ggml_backend_cuda_strix_ab") == 0) {
         return (void *)ggml_cuda_strix_ab;
+    }
+    // strixllama: the delta net's record replay for the memory's checkpoints and copies (gated_delta_net.cuh)
+    if (strcmp(name, "ggml_backend_cuda_gdn_replay") == 0) {
+        return (void *)ggml_backend_cuda_gdn_replay;
     }
     return nullptr;
 }

@@ -1,8 +1,12 @@
 #include "parsers.h"
+#include "json-schema-to-grammar.h"
 
 #include "log.h"
 
+#include <map>
 #include <set>
+#include <string>
+#include <vector>
 
 void foreach_function(const json & tools, const std::function<void(const json &)> & fn) {
     for (const auto & tool : tools) {
@@ -18,7 +22,9 @@ void foreach_parameter(const json & function, const std::function<void(const std
     if (!function.contains("parameters") || !function.at("parameters").is_object()) {
         return;
     }
-    const auto & params = function.at("parameters");
+    // strixllama: the parameters as one flat list whatever form the schema takes (common_tool_parameters_flatten): a
+    // top-level oneOf, allOf or $ref had no parameter here, so the grammar allowed an empty call and nothing else
+    const json params = common_tool_parameters_flatten(function.at("parameters"));
     if (!params.contains("properties") || !params.at("properties").is_object()) {
         return;
     }

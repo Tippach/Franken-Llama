@@ -49,8 +49,10 @@ An already-set environment value always wins over the file's default:
 - `PORT`   — listen port (default 9931)
 - `HOSTIP` — bind address (default 127.0.0.1)
 - `PARALLEL`   — concurrent conversations / slots (default `1`)
-- `KVCHAIN`    — `1` enables the disk-backed hash-chain KV cache (default `1`; set `0` for RAM/VRAM only)
-- `KVCHAIN_GB` — disk quota in GiB for the chain when enabled (default 100)
+- `CACHE`      — prompt cache on disk: `kvchain` (default) / `disk` / `auto` / `off`. Exactly one
+  mechanism runs — the server refuses to start with both. See "Prompt cache on disk".
+- `KVCHAIN_GB` — disk quota in GiB for kv-chain mode (default 100)
+- `PCCACHE_GB` — disk quota in GiB for disk-prompt-cache mode (default 64)
 - `SSL`        — `1` serves HTTPS/TLS instead of plain HTTP (default `0`)
 - `SSL_KEY`    — PEM private key path (default `launcher\key.pem`, only used when `SSL=1`)
 - `SSL_CERT`   — PEM certificate chain path (default `launcher\cert.pem`, only used when `SSL=1`)
@@ -183,13 +185,27 @@ point `MTP` at your own draft file — with `LATIN=1` a local draft must already
   untouched so gates can be steered by hand. It is an escape hatch, not a tuning knob — a wrong gate
   value can corrupt output.
 
-## Disk KV cache (`KVCHAIN=1`, default)
-Streams per-chunk KV state to `launcher\kv-chain\` keyed by a content hash-chain, so a shared prompt
-prefix is a **cache hit even after a restart** — instead of being evicted from scarce RAM/VRAM. This
-suits a unified-memory box where RAM is tight and SSD is cheap.
-- On by default. Disable with `set KVCHAIN=0` to keep the cache in RAM/VRAM only.
-- `KVCHAIN_GB` caps the folder size (LRU by file mtime); the state survives a reboot.
-- Chunks are sized by the batch `-ub` (8192).
+## Prompt cache on disk (`CACHE=kvchain`, default)
+Finished or evicted conversations come back from SSD instead of being re-prefilled — on this
+unified-memory box RAM is tight and SSD is cheap. Exactly one mechanism runs; the default,
+**kv-chain**, covers every config, text and image alike:
+
+- **kv-chain** (`CACHE=kvchain`, the default; `launcher\prompt-cache\`, quota `KVCHAIN_GB`): a content
+  hash-chain of KV chunks written as prefill runs. It is the only mechanism that stores conversations
+  containing **images** — the text between and after screenshots stays cached (agentic screenshot loops
+  keep their prefix), and a changed image correctly invalidates only the text after it. Chunks are sized
+  by the batch `-ub` (8192); state survives a reboot.
+- **text-only → disk prompt cache** (`launcher\prompt-cache\`, quota `PCCACHE_GB`): the tier under
+  the RAM prompt cache — a conversation's attention rows are written once per 4096 positions as they
+  are computed, its recurrent state when it leaves its slot; checkpoints page to disk so a warm
+  conversation holds no cold RAM. A ~170K-token conversation reads back in a couple of seconds,
+  byte-identical to keeping it resident. Conversations containing images are **not** stored.
+- `CACHE=off` keeps everything in RAM/VRAM only. `CACHE=auto` picks kv-chain when vision is on and
+  the disk tier otherwise. Force one mechanism with `CACHE=kvchain` /
+  `CACHE=disk` (e.g. `CACHE=disk` to save the ~865 MB projector's VRAM while text chats still
+  persist). The server exits at startup if both are ever requested.
+
+(Legacy: `KVCHAIN=0`/`KVCHAIN=1` still work and map to `CACHE=off`/`CACHE=kvchain`.)
 
 ## Multiple slots (`PARALLEL>1`)
 `PARALLEL>1` serves several conversations at once. It **requires** a unified KV cache, which the launcher

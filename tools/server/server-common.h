@@ -192,6 +192,12 @@ public:
     // returns a pair of pointer to the chunk (nullptr if not found) and its start index in tokens
     std::pair<const mtmd::input_chunk_ptr *, size_t> find_next_media_chunk(size_t idx) const;
 
+    // strixllama: index of the first image/audio cell, or npos when the prompt is pure text. NOT the
+    // same question as has_mtmd, which only says a vision model is loaded: with --mmproj the OAI chat
+    // path builds every prompt through process_mtmd_prompt(), which sets has_mtmd = true even for a
+    // request with zero images. Anything that needs "is this prompt actually plain text" must ask this.
+    size_t first_media_idx() const;
+
     void push_back(llama_token tok);
 
     // will create a copy of the chunk if it contains non-text data

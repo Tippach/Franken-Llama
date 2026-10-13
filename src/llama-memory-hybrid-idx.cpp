@@ -492,6 +492,32 @@ static uint64_t hybrid_idx_dense_n_kv(const llama_kv_cache & kv, const llama_bat
     return std::min(pool, own);
 }
 
+// strixllama (issue #13): a text ubatch of one conversation that holds images keeps the compact sparse-attention
+// inputs when every image cell of the conversation lies before the ubatch's first position: such a cell is visible to
+// every query by its position alone (the M-RoPE rule only orders cells that share the query's position), and
+// set_input_qsa ranks the cells and fills the compact metadata in that rank space, as it does for the MTP draft after
+// an image. It used to take the dense inputs for the rest of the conversation - a mask and a bias over n_kv x n_tokens
+// built on the host, its ubatch held to 2^27 cell-token pairs - and prefill after one image fell from ~1,500 to
+// ~200 t/s at 170K. STRIX_IMAGE_TEXT_COMPACT=0: the dense inputs again.
+static bool hybrid_idx_image_text_compact() {
+    static const bool on = [] {
+        const char * e = getenv("STRIX_IMAGE_TEXT_COMPACT");
+        return !e || atoi(e) != 0;
+    }();
+    return on;
+}
+
+// whether a cell of `seq` holds an image token (its 2-D position differs from its 1-D one) at or after `pmin`
+static bool hybrid_idx_image_from(const llama_kv_cells & cells, llama_seq_id seq, llama_pos pmin, uint32_t off, uint32_t n) {
+    for (uint32_t j = off; j < off + n && j < cells.size(); ++j) {
+        if (!cells.is_empty(j) && cells.seq_has(j, seq) && cells.pos_get(j) >= pmin &&
+                cells.ext_get(j).is_2d_gt(cells.pos_get(j), cells.pos_get(j))) {
+            return true;
+        }
+    }
+    return false;
+}
+
 llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     // strixllama: once a conversation holds an image (or a position gap, kb_dup), its ubatches take the dense
     // sparse-attention inputs - a KQ mask and a per-block bias over n_kv x n_tokens, ~6.6 bytes a pair staged in
@@ -502,7 +528,26 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr 
     // costs it little: the same 27 images prefilled at the same rate, the append at 245 t/s instead of 261 at 2^28,
     // and the machine kept 11 GiB of RAM instead of 3. Text before any image keeps the full ubatch.
     // STRIX_DENSE_UBATCH_BUDGET sets the bound in cell-token pairs (0 = no bound).
-    if (kb_dup) {
+    // strixllama (issue #13): only batches that take the dense inputs are bound - an image (embeddings without tokens),
+    // several conversations, or text that an image cell does not wholly precede. One conversation's text after its
+    // images takes the compact inputs (qsa_scalar_visibility), and so does the MTP draft head (tokens with embeddings),
+    // whose catch-up after an image was held to the bound for nothing.
+    bool dense_batch = kb_dup;
+    if (dense_batch && hybrid_idx_image_text_compact()) {
+        const llama_batch & b = balloc.get_batch();
+        bool one_text_seq = b.token != nullptr && b.n_tokens > 0 && b.pos && b.n_seq_id && b.seq_id &&
+                b.n_seq_id[0] == 1 && b.seq_id[0][0] >= 0 && b.seq_id[0][0] < LLAMA_MAX_SEQ;
+        llama_pos pmin = one_text_seq ? b.pos[0] : 0;
+        for (int32_t i = 0; one_text_seq && i < b.n_tokens; ++i) {
+            one_text_seq = b.n_seq_id[i] == 1 && b.seq_id[i][0] == b.seq_id[0][0];
+            pmin = std::min(pmin, b.pos[i]);
+        }
+        if (one_text_seq) {
+            const auto & cells = get_mem_idx()->get_cells(b.seq_id[0][0]);
+            dense_batch = hybrid_idx_image_from(cells, b.seq_id[0][0], pmin, 0, cells.size());
+        }
+    }
+    if (dense_batch) {
         static const uint64_t budget = [] {
             const char * e = getenv("STRIX_DENSE_UBATCH_BUDGET");
             return e ? (uint64_t) strtoull(e, nullptr, 10) : (uint64_t) 1 << 27;
@@ -1128,25 +1173,68 @@ bool llama_memory_hybrid_idx::set_input_qsa_run(qsa_run_inputs & out, ggml_tenso
         GGML_ABORT("qsa run: no run for the sequence");
     };
 
+    // strixllama: one conversation - every decode step of one, which is the case that costs - enumerates its blocks in
+    // one stretch: the list above pushes (0, R.first), (0, R.first+1), ..., so blk_run is all 0 and blk_pb is
+    // R.first + b. Every array below is then an arithmetic sequence and fills consecutively, instead of through the
+    // lambdas' indirection (blk_run[b], then runs[..], then blk_pb[b]), which at 262K measured ~2.9 ns an element -
+    // 2.7 GB/s, so the pass was bound by its own indexing and not by the memory it writes. blk_cells steps by 1
+    // because a block's r cells are consecutive; bid_rows steps by 1 because the block-key cache lays rows by residue
+    // mod r (kb_row), so consecutive blocks of one run land in consecutive rows. The general path stays for several
+    // runs, where neither holds.
+    const bool one_run = runs.size() == 1;
+    const run_t & R0 = runs[0];
+    const int64_t pbase = R0.first*r;                                  // blk_pos and limits: pbase + b*r
+    const int64_t cbase = (int64_t) R0.c0 - kv_off + pbase - R0.p0;    // blk_cells: cbase + i, i = b*r + k
+    const int64_t xbase = (int64_t) R0.c0 + pbase - R0.p0;             // bid_rows: kb_row(xbase + b*r) = +b
+
+#ifndef NDEBUG
+    if (one_run) {   // the claim above, checked once a step on the debug build
+        GGML_ASSERT(n_bid == (R0.first <= R0.last ? R0.last - R0.first + 1 : 0));
+        for (int64_t b = 0; b < n_bid; ++b) {
+            GGML_ASSERT(blk_run[b] == 0 && blk_pb[b] == R0.first + b);
+        }
+    }
+#endif
+
     if (blk_cells->data) {
         out.blk_cells.assign(r*n_blocks, 0);
-        for (int64_t b = 0; b < n_bid; ++b) {
-            for (int64_t k = 0; k < r; ++k) {
-                out.blk_cells[b*r + k] = cell(runs[blk_run[b]], bpos(b) + k);
+        if (one_run) {
+            for (int64_t i = 0, n = r*n_bid; i < n; ++i) {
+                out.blk_cells[i] = (int32_t) (cbase + i);
+            }
+        } else {
+            for (int64_t b = 0; b < n_bid; ++b) {
+                for (int64_t k = 0; k < r; ++k) {
+                    out.blk_cells[b*r + k] = cell(runs[blk_run[b]], bpos(b) + k);
+                }
             }
         }
     }
     if (blk_pos->data) {
         out.blk_pos.assign(4*n_blocks, 0);
         for (int64_t sec = 0; sec < 4; ++sec) {
-            for (int64_t b = 0; b < n_bid; ++b) {
-                out.blk_pos[sec*n_blocks + b] = bpos(b);
+            int32_t * dst = out.blk_pos.data() + sec*n_blocks;
+            if (one_run) {
+                for (int64_t b = 0; b < n_bid; ++b) {
+                    dst[b] = (int32_t) (pbase + b*r);
+                }
+            } else {
+                for (int64_t b = 0; b < n_bid; ++b) {
+                    dst[b] = bpos(b);
+                }
             }
         }
     }
     out.limits.resize(n_blocks + n_tokens);
-    for (int64_t b = 0; b < n_blocks; ++b) {
-        out.limits[b] = b < n_bid ? bpos(b) : INT32_MAX;
+    if (one_run) {
+        for (int64_t b = 0; b < n_bid; ++b) {
+            out.limits[b] = (int32_t) (pbase + b*r);
+        }
+        std::fill(out.limits.begin() + n_bid, out.limits.begin() + n_blocks, INT32_MAX);
+    } else {
+        for (int64_t b = 0; b < n_blocks; ++b) {
+            out.limits[b] = b < n_bid ? bpos(b) : INT32_MAX;
+        }
     }
     if (mixed_seqs) {
         out.seq_blk.assign(n_slots*n_blocks, 0.0f);
@@ -1199,9 +1287,22 @@ bool llama_memory_hybrid_idx::set_input_qsa_run(qsa_run_inputs & out, ggml_tenso
         }
         const int32_t scratch = (int32_t) kb_scratch_row();
         out.bid_rows.resize(n_blocks);
-        for (int64_t b = 0; b < n_blocks; ++b) {
-            out.bid_rows[b] = b < n_bid ? (int32_t) kb_row(kv_off + bcell(b)) : scratch;
+        // strixllama: kb_row lays a cell's row by residue mod kb_r, so one run's consecutive blocks - whose cells
+        // step by r exactly - land in consecutive rows: kb_row(xbase + b*r) = kb_row(xbase) + b. The cache is sized
+        // that way (kb_r = ratio), but the step is only taken when it holds, so a differently sized cache keeps the
+        // general path instead of writing wrong rows.
+        const bool rows_step1 = one_run && kb_r == r;
+        if (rows_step1) {
+            const int32_t xrow = (int32_t) kb_row(xbase);
+            for (int64_t b = 0; b < n_bid; ++b) {
+                out.bid_rows[b] = xrow + (int32_t) b;
+            }
+        } else {
+            for (int64_t b = 0; b < n_bid; ++b) {
+                out.bid_rows[b] = (int32_t) kb_row(kv_off + bcell(b));
+            }
         }
+        std::fill(out.bid_rows.begin() + n_bid, out.bid_rows.end(), scratch);
     }
     if (kb && kb->dirty_dst && kb->dirty_dst->data) {
         const int64_t dirty_max = kb->dirty_dst->ne[0];
@@ -2190,8 +2291,15 @@ bool llama_memory_hybrid_idx_context::qsa_scalar_visibility(const llama_ubatch &
             runs=!seqs.test(s) || cells.seq_run(s,c0,c1,p0);
         }
         const uint32_t off=get_idx()->get_kv_off();   // strixllama: the window's first cell
+        // strixllama (issue #13): an image cell before every query of this text ubatch is visible to all of them by its
+        // position alone, and set_input_qsa ranks the cells for the compact metadata; only one at or after the
+        // ubatch's first position needs the dense inputs (see hybrid_idx_image_text_compact)
+        const bool text_compact=hybrid_idx_image_text_compact();
+        llama_pos pmin=ubatch.pos[0];
+        for (uint32_t i=1;text_compact && i<ubatch.n_tokens;++i) { pmin=std::min(pmin,ubatch.pos[i]); }
         for (uint32_t j=off;!runs && j<off+get_idx()->get_n_kv();++j) {
-            if (!cells.is_empty(j) && (cells.seq_get_all(j) & seqs).any() && cells.ext_get(j).is_2d_gt(cells.pos_get(j),cells.pos_get(j))) { return false; }
+            if (!cells.is_empty(j) && (cells.seq_get_all(j) & seqs).any() && cells.ext_get(j).is_2d_gt(cells.pos_get(j),cells.pos_get(j)) &&
+                    (!text_compact || cells.pos_get(j)>=pmin)) { return false; }
         }
     }
     return true;

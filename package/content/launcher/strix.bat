@@ -29,6 +29,29 @@ REM --- all native DLLs resolve from the runtime folder first ---
 set "PATH=%RUNTIME%;%PATH%"
 
 REM ============================================================================
+REM  QUICK ACCESS - the four knobs most people actually change. Edit these here.
+REM  Each keeps an already-set environment value (a shell can still override),
+REM  and the details live in the matching sections further down.
+REM    VISION=1     image input: loads the ~865 MB vision projector. Also selects
+REM                 kv-chain as the prompt cache on disk - the only one that stores
+REM                 conversations containing images (agentic screenshot loops).
+REM    PARALLEL=2   two conversations at once; auto-switches the cache to --kv-unified. With two or
+REM                 more generating at the same time the server also adapts the draft length to what
+REM                 is actually being accepted (STRIX_SPEC_ADAPT, on by default) - nothing to set.
+REM    YARN=1       rope scaling so CTX can exceed the trained 262144. Pair with
+REM                 CTX=524288 for ~512k context. Leave YARN=0 at or below 262144.
+REM    CTX=524288   context size in tokens; go above 262144 only together with YARN=1.
+REM  The defaults below are the validated single-user text config; uncomment to raise.
+REM ============================================================================
+if not defined VISION set "VISION=0"
+if not defined PARALLEL set "PARALLEL=1"
+if not defined YARN set "YARN=0"
+if not defined CTX set "CTX=262144"
+REM set "VISION=1"
+REM set "PARALLEL=2"
+REM set "YARN=1" & set "CTX=524288"
+
+REM ============================================================================
 REM  EDIT ME - the end-user knobs. An already-set environment value wins over
 REM  each 'if not defined' line, so a shell can override without editing this file.
 REM ============================================================================
@@ -75,11 +98,26 @@ REM output (the target still verifies over the full vocabulary) with far less ba
 REM Tuned for Latin/English. For Chinese or other CJK set LATIN=0.
 if not defined LATIN set "LATIN=1"
 
-REM --- disk-backed KV cache (default ON) ------------------------------------------
-REM Streams KV state to disk so prefix cache hits survive a restart and are not lost to
-REM RAM/VRAM pressure. KVCHAIN_GB is the disk quota in GiB.
-if not defined KVCHAIN set "KVCHAIN=1"
+REM --- prompt cache on disk ---------------------------------------------------------
+REM Exactly ONE mechanism runs (they are mutually exclusive - the server refuses both).
+REM Default CACHE=kvchain: the hash-chain KV cache handles text AND image conversations, so
+REM it is the safe choice for every config - it is the only one that stores a conversation
+REM containing images, and it caches the text between and after screenshots (an agentic
+REM screenshot loop keeps its prefix). Other values:
+REM   CACHE=disk  the rulith disk prompt cache under --cache-ram (text-only: image chats are
+REM               not stored); rows written once per 4096 positions, checkpoints paged to disk.
+REM   CACHE=auto  pick kvchain when VISION=1, disk otherwise (the pre-split behavior).
+REM   CACHE=off   no prompt cache on disk, RAM/VRAM only.
+REM Quotas: KVCHAIN_GB (kvchain) / PCCACHE_GB (disk) are GiB on disk.
 if not defined KVCHAIN_GB set "KVCHAIN_GB=100"
+if not defined PCCACHE_GB set "PCCACHE_GB=64"
+REM back-compat: the old KVCHAIN=0/1 switch still works (this bat no longer defaults it,
+REM so "defined" here means the user set it): 0 -> nothing on disk, 1 -> force kv-chain
+if defined KVCHAIN if not defined CACHE (
+  if "!KVCHAIN!"=="0" set "CACHE=off"
+  if "!KVCHAIN!"=="1" set "CACHE=kvchain"
+)
+if not defined CACHE set "CACHE=kvchain"
 
 REM --- concurrent conversations (slots) -------------------------------------------
 REM PARALLEL=1 runs one conversation at a time. PARALLEL>1 runs several at once and
@@ -126,6 +164,62 @@ if defined MTP if /I not "!MTP:~-5!"==".gguf" if not defined MTP_FILE set "MTP_A
 REM projector
 if "!VISION!"=="1" (set "MM_MODE=--mmproj-auto") else (set "MM_MODE=--no-mmproj")
 if defined MMPROJ set "MM_MODE=-mm "!MMPROJ!""
+
+REM prompt cache on disk: resolve auto now that VISION is final (MMPROJ= implies vision),
+REM then derive the flag set. Exactly ONE mechanism - the server refuses to run with both.
+REM --cache-ram 0 disables the prompt cache entirely, which is what the kv-chain path wants:
+REM the hash-chain store owns prompt state on disk there. The disk tier needs a RAM prompt
+REM cache to be a tier under - 1 GiB keeps short conversations resident and hands the rest
+REM to disk (rulith's own manager value); idle slots stay in their slots (--no-cache-idle-slots).
+if /I "!CACHE!"=="auto" (
+  if "!VISION!"=="1" (set "CACHE=kvchain") else (set "CACHE=disk")
+)
+REM one shared directory for whichever mechanism runs: the two formats are unrelated, so a
+REM flip of VISION/CACHE must not leave the other mechanism's bytes behind - the stamp file
+REM below records who owns the dir and the whole dir is wiped when ownership changes.
+if not defined CACHE_DIR set "CACHE_DIR=%HERE%prompt-cache"
+if /I "!CACHE!"=="kvchain" (
+  set "PC_ARGS=--cache-ram 0"
+  set "PC_ARGS=!PC_ARGS! --kv-chain-dir "!CACHE_DIR!" --kv-chain-limit-gb %KVCHAIN_GB%"
+)
+if /I "!CACHE!"=="disk" (
+  set /A "PC_MIB = PCCACHE_GB * 1024"
+  set "PC_ARGS=--cache-ram 1024 --no-cache-idle-slots"
+  set "PC_ARGS=!PC_ARGS! --cache-disk-dir "!CACHE_DIR!" --cache-disk-limit-mib !PC_MIB!"
+)
+if /I "!CACHE!"=="off" set "PC_ARGS=--cache-ram 0"
+if /I not "!CACHE!"=="kvchain" if /I not "!CACHE!"=="disk" if /I not "!CACHE!"=="off" (
+  echo [ERROR] CACHE must be auto, kvchain, disk, or off ^(got "!CACHE!"^).
+  pause
+  exit /b 1
+)
+
+REM ownership stamp: owner.txt inside the shared dir names the mechanism that last wrote it.
+REM A flip (VISION switched, or CACHE forced) wipes the dir's CONTENTS first - the two on-disk
+REM formats are unrelated and neither store evicts the other's files, so without this the dir
+REM silently accumulates dead chunks/runs from the mechanism no longer running.
+if /I not "!CACHE!"=="off" (
+  REM migration: the old bat gave each mechanism its own folder (launcher\kv-chain); once the
+  dir is shared, a leftover one is exactly the ancient clutter this section exists to prevent
+  if /I not "!CACHE_DIR!"=="%HERE%kv-chain" if exist "%HERE%kv-chain" (
+    echo  CACHE : removing old per-mechanism cache folder %HERE%kv-chain
+    rd /s /q "%HERE%kv-chain"
+  )
+  if not exist "!CACHE_DIR!" mkdir "!CACHE_DIR!"
+  set "PC_OWNER="
+  if exist "!CACHE_DIR!\owner.txt" set /p PC_OWNER=<"!CACHE_DIR!\owner.txt"
+  if /I not "!PC_OWNER!"=="!CACHE!" (
+    REM a real flip: the dir held the other mechanism's bytes - clear them before restamping.
+    REM on a first-ever run PC_OWNER is empty and there is nothing of the other arm to remove,
+    REM so only stamp; del/rd are silenced so an empty dir never prints "File Not Found".
+    if not "!PC_OWNER!"=="" (
+      echo  CACHE : wiping !CACHE_DIR! ^(held !PC_OWNER! data, now !CACHE!^)
+      del /q /f "!CACHE_DIR!\*.*" >nul 2>nul
+      for /d %%D in ("!CACHE_DIR!\*") do rd /s /q "%%D" >nul 2>nul
+    )
+    >"!CACHE_DIR!\owner.txt" (echo !CACHE!)
+  )
+)
 
 REM YaRN: scale the rope so CTX beyond the trained 262144 stays in distribution.
 REM Appended to ARGS further down (not inline) so an inactive YARN=0 leaves no stray spaces.
@@ -186,6 +280,9 @@ if defined MTP ( echo  DRAFT : !MTP_ARGS! ) else ( echo  DRAFT : ^(none - MTP di
 if defined CTPL ( echo  TPL   : !CTPL! ) else ( echo  TPL   : ^(model-embedded^) )
 if "!SSL!"=="1" (echo  SCHEME: https  cert=!SSL_CERT!) else (echo  SCHEME: http)
 if "!VISION!"=="1" (echo  VISION: ON   !MM_MODE!) else (echo  VISION: off  ^(text only; set VISION=1 for image input^))
+if /I "!CACHE!"=="kvchain" echo  CACHE : kv-chain  dir=!CACHE_DIR!  quota=%KVCHAIN_GB% GiB - the only tier that stores image conversations
+if /I "!CACHE!"=="disk"    echo  CACHE : disk prompt cache  dir=!CACHE_DIR!  quota=%PCCACHE_GB% GiB - text-only, image chats are not cached
+if /I "!CACHE!"=="off"     echo  CACHE : off - RAM/VRAM only
 if "!YARN!"=="1" (echo  ROPE  : YaRN scale !YARN_SCALE! ^(orig ctx 262144^)) else (echo  ROPE  : native)
 echo  CTX   : %CTX%   PORT: %HOSTIP%:%PORT%
 echo  RUNTIME: %RUNTIME%
@@ -199,7 +296,7 @@ if defined MTP echo.
 REM ============================================================================
 REM  Build the command line
 REM ============================================================================
-set "ARGS=!MODEL_FLAG! "!MODEL!" -ngl 99 --ctx-size %CTX% -b 8192 -ub 8192 --flash-attn on -t 4 --parallel %PARALLEL% --port %PORT% --host %HOSTIP% --temp 1.0 --presence-penalty 0.0 --repeat-penalty 1.0 --cache-ram 0 %KV_MODE% %MM_MODE% --fit off --load-mode none --lazy-mode on-direct"
+set "ARGS=!MODEL_FLAG! "!MODEL!" -ngl 99 --ctx-size %CTX% -b 8192 -ub 8192 --flash-attn on -t 4 --parallel %PARALLEL% --port %PORT% --host %HOSTIP% --temp 1.0 --presence-penalty 0.0 --repeat-penalty 1.0 %PC_ARGS% %KV_MODE% %MM_MODE% --fit off --load-mode none --lazy-mode on-direct"
 
 REM rope scaling only when asked for; appended so the default line is untouched
 if "!YARN!"=="1" set "ARGS=%ARGS% --rope-scaling yarn --rope-scale !YARN_SCALE! --yarn-orig-ctx 262144"
@@ -215,13 +312,7 @@ if defined MTP if "!LATIN!"=="1" set "ARGS=%ARGS% --spec-draft-vocab-latin"
 
 if "!SSL!"=="1" set "ARGS=%ARGS% --ssl-key-file "!SSL_KEY!" --ssl-cert-file "!SSL_CERT!""
 
-if "!KVCHAIN!"=="1" (
-  if not exist "%HERE%kv-chain" mkdir "%HERE%kv-chain"
-  set "ARGS=%ARGS% --kv-chain-dir "!HERE!kv-chain" --kv-chain-limit-gb %KVCHAIN_GB%"
-  echo  KVCHAIN: ON  dir=%HERE%kv-chain  quota=%KVCHAIN_GB% GiB
-) else (
-  echo  KVCHAIN: OFF ^(RAM/VRAM cache only^)
-)
+
 
 REM ============================================================================
 REM  Launch
