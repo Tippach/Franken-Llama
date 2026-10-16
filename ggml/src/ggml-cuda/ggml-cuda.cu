@@ -110,6 +110,7 @@ void ggml_cuda_op_moe_weighted_reduction(ggml_backend_cuda_context & ctx, const 
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -2802,7 +2803,9 @@ static void strix_tl_after(ggml_backend_cuda_context * ctx, const void * graph_k
             fprintf(stderr, "GPU_ORDER %5zu %9.2f us  %s\n", k, (double) (int64_t) (ts[k + 2] - ts[k + 1]) * us - overhead, c.keys[k].c_str());
         }
     }
-    if (++a.readings % 8 != 0) {
+    // STRIX_GPU_TIMELINE_PRINT=n: a table every n readings (default 8; 1 for a single prompt)
+    static const int print_every = getenv("STRIX_GPU_TIMELINE_PRINT") ? std::max(1, atoi(getenv("STRIX_GPU_TIMELINE_PRINT"))) : 8;
+    if (++a.readings % print_every != 0) {
         return;
     }
     std::vector<std::pair<std::string, std::pair<double, double>>> rows(a.by_class.begin(), a.by_class.end());
@@ -3458,8 +3461,42 @@ static bool strixllama_skip_op(const ggml_tensor * node) {
         }
         return v;
     }();
-    if (wanted.empty()) { return false; }
+    if (wanted.empty() && !(getenv("STRIX_SKIP_DUMP") && atoi(getenv("STRIX_SKIP_DUMP")) == 2)) { return false; }
     const char * op = ggml_op_name(node->op);
+    // strixllama: STRIX_SKIP_DUMP=1 logs each DISTINCT (op, ne0, ne1) that actually MATCHED, so a null
+    // ablation result can be told apart from "the pattern matched no node at all". The startup banner
+    // only proves the env parsed, which is NOT an engagement assert: MUL_MAT@128 printing the banner
+    // while matching zero decode nodes is a void result, not evidence of innocence.
+    //
+    // STRIX_SKIP_DUMP=2 is the census mode: log every DISTINCT node shape in the graph and skip
+    // nothing. Range patterns like MUL_MAT@4000-25000 cannot isolate an op by what it IS, only by what
+    // it looks like, and the indexer score GEMM shares its ne0 band with the MoE GEMMs - a confounded
+    // ablation. The census lists every shape once with its name, so a suspect is picked from the
+    // measured shapes (and its ne0 tells whether it scales with depth) instead of guessed at.
+    static const int strixllama_skip_dump = getenv("STRIX_SKIP_DUMP") ? atoi(getenv("STRIX_SKIP_DUMP")) : 0;
+    auto strixllama_skip_hit = [&]() {
+        if (strixllama_skip_dump) {
+            static std::mutex                mtx;
+            static std::set<std::string>     seen;
+            char buf[96];
+            snprintf(buf, sizeof(buf), "SKIP_HIT %s ne0=%lld ne1=%lld", op,
+                     (long long) node->ne[0], (long long) node->ne[1]);
+            std::lock_guard<std::mutex> lock(mtx);
+            if (seen.insert(std::string(buf)).second) { fprintf(stderr, "%s\n", buf); }
+        }
+        return true;
+    };
+    if (strixllama_skip_dump == 2) {
+        static std::mutex            mtx2;
+        static std::set<std::string> seen2;
+        char buf[160];
+        snprintf(buf, sizeof(buf), "NODE %s ne0=%lld ne1=%lld ne2=%lld ne3=%lld name=%s", op,
+                 (long long) node->ne[0], (long long) node->ne[1], (long long) node->ne[2],
+                 (long long) node->ne[3], node->name[0] ? node->name : "-");
+        std::lock_guard<std::mutex> lock(mtx2);
+        if (seen2.insert(std::string(buf)).second) { fprintf(stderr, "%s\n", buf); }
+        return false;
+    }
     for (const auto & w : wanted) {
         // DEV: OP@ne0 skips only the nodes of that op whose ne[0] is ne0 (e.g. MUL_MAT@320); OP@lo-hi those whose ne[0]
         // is in [lo, hi]; * for OP takes every op
@@ -3470,15 +3507,15 @@ static bool strixllama_skip_op(const ggml_tensor * node) {
                 const long long lo = atoll(w.c_str() + at + 1);
                 const size_t dash = w.find('-', at + 1);
                 const long long hi = dash != std::string::npos ? atoll(w.c_str() + dash + 1) : lo;
-                if (node->ne[0] >= lo && node->ne[0] <= hi) { return true; }
+                if (node->ne[0] >= lo && node->ne[0] <= hi) { return strixllama_skip_hit(); }
             }
             continue;
         }
         const size_t colon = w.find(':');
-        if (colon == std::string::npos) { if (w == op) { return true; } continue; }
+        if (colon == std::string::npos) { if (w == op) { return strixllama_skip_hit(); } continue; }
         if (w.compare(0, colon, op) != 0) { continue; }
-        if (node->op == GGML_OP_UNARY && w.compare(colon + 1, std::string::npos, ggml_unary_op_name(ggml_get_unary_op(node))) == 0) { return true; }
-        if (node->op == GGML_OP_GLU && w.compare(colon + 1, std::string::npos, ggml_glu_op_name(ggml_get_glu_op(node))) == 0) { return true; }
+        if (node->op == GGML_OP_UNARY && w.compare(colon + 1, std::string::npos, ggml_unary_op_name(ggml_get_unary_op(node))) == 0) { return strixllama_skip_hit(); }
+        if (node->op == GGML_OP_GLU && w.compare(colon + 1, std::string::npos, ggml_glu_op_name(ggml_get_glu_op(node))) == 0) { return strixllama_skip_hit(); }
     }
     return false;
 }
@@ -5222,6 +5259,68 @@ static void ggml_cuda_idx_dec_check(ggml_backend_cuda_context & ctx, const ggml_
     }
 }
 
+// strixllama: SSM_SCAN and the CPY of its new states into the recurrent cache (Mamba-2, one snapshot slot): the scan
+// writes the cache rows itself, several sequences at once (ggml_cuda_ssm_scan_cache), and the CPY dispatches nothing.
+// At eight conversations the copy was 310 us of each of Nemotron 3.5 Super's 40 Mamba layers (4 MiB of state a sequence).
+static int ggml_cuda_ssm_scan_cache_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+#ifdef GGML_USE_HIP
+    static const bool on = !getenv("STRIX_SSM_CACHE") || atoi(getenv("STRIX_SSM_CACHE")) != 0;
+    ggml_tensor * ssm = cgraph->nodes[i];
+    if (!on || ssm->op != GGML_OP_SSM_SCAN || ssm->type != GGML_TYPE_F32 || (ssm->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return 0;
+    }
+    const ggml_tensor * s = ssm->src[0];
+    const ggml_tensor * x = ssm->src[1];
+    if (ggml_get_op_params_i32(ssm, 0) > 1 || ssm->src[3]->nb[1] != sizeof(float) || s->type != GGML_TYPE_F32) {
+        return 0;
+    }
+    // the CPY is the first node after the scan that dispatches anything (the extra states' copy is empty)
+    const ggml_tensor * cpy = nullptr;
+    int skip = 0;
+    for (int j = i + 1; j < cgraph->n_nodes && cpy == nullptr; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(n)) {
+            continue;
+        }
+        if (n->op != GGML_OP_CPY || (n->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            return 0;
+        }
+        cpy  = n;
+        skip = j - i;
+    }
+    if (cpy == nullptr) {
+        return 0;
+    }
+    const int64_t n_seqs = x->ne[3];
+    const int64_t D      = s->ne[0] * s->ne[1] * s->ne[2];
+    const ggml_tensor * tail = cpy->src[0];
+    const ggml_tensor * rows = cpy->src[1];
+    if (tail->op != GGML_OP_VIEW || tail->view_src != ssm || tail->view_offs != (size_t) ggml_nelements(x) * sizeof(float) || !ggml_is_contiguous(tail) ||
+            tail->ne[0] != D || ggml_nelements(tail) != D * n_seqs) {
+        return 0;
+    }
+    // the rows are rows of the states the scan reads, which its ids count from s's first
+    const ggml_tensor * root = s->view_src ? s->view_src : s;
+    if (rows->op != GGML_OP_VIEW || rows->type != GGML_TYPE_F32 || rows->data == nullptr || rows->view_src != root ||
+            s->data != root->data || rows->ne[0] != D || rows->ne[1] != n_seqs || ggml_nelements(rows) != D * n_seqs ||
+            rows->nb[0] != sizeof(float) || rows->nb[1] != s->nb[3] || s->nb[3] != (size_t) D * sizeof(float)) {
+        return 0;
+    }
+    const ptrdiff_t off = (const char *) rows->data - (const char *) s->data;
+    if (off < 0 || off % (ptrdiff_t) s->nb[3] != 0) {
+        return 0;
+    }
+    ggml_cuda_ssm_scan_cache c;
+    c.rows = (char *) rows->data;
+    c.row0 = getenv("STRIX_SSM_CACHE_FIXUP_ALL") ? -1 : off / (ptrdiff_t) s->nb[3];   // DEV: every sequence through the fixup
+    ggml_cuda_op_ssm_scan(ctx, ssm, &c);
+    return skip;
+#else
+    GGML_UNUSED(ctx); GGML_UNUSED(cgraph); GGML_UNUSED(i);
+    return 0;
+#endif
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -5230,6 +5329,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    if (node->op == GGML_OP_SSM_SCAN) {
+        const int sk = ggml_cuda_ssm_scan_cache_fuse(*cuda_ctx, cgraph, i);
+        if (sk > 0) {
+            return sk;
+        }
+    }
 
     // strixllama: a decode strip's indexer score (ggml_cuda_match_idx_score_dec): skip the keys' GET_ROWS and its RESHAPE,
     // run the whole score at the MUL_MAT
@@ -5242,7 +5348,29 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
     if (node->op == GGML_OP_GET_ROWS && GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
         ggml_cuda_idx_dec_match m;
-        if (ggml_cuda_match_idx_score_dec(cgraph, i, m)) {
+        // strixllama DEV: STRIX_IDX_DEC_DBG=1 names WHY an indexer-key GET_ROWS did NOT fuse. The matcher has
+        // ~40 guards and a silent false is indistinguishable from "not an indexer gather" - the exact dead-code
+        // trap. When a GET_ROWS looks like an indexer-key gather (ne0=128, src0 f16 ne0=128, 1-D rows) but the
+        // matcher declines, print the strip shape (the node + the MUL_MAT's query width) so the failing guard is
+        // visible. This is how the MTP-draft graph's non-fusing was to be diagnosed rather than guessed.
+        static const bool idx_dbg = getenv("STRIX_IDX_DEC_DBG") && atoi(getenv("STRIX_IDX_DEC_DBG"));
+        const bool looks_like_idx = node->ne[0] == 128 && node->src[0] && node->src[0]->type == GGML_TYPE_F16 &&
+                                    node->src[0]->ne[0] == 128 && node->src[1] && node->src[1]->ne[1] == 1;
+        const bool fused = ggml_cuda_match_idx_score_dec(cgraph, i, m);
+        if (idx_dbg && looks_like_idx && !fused) {
+            static int decl = 0;
+            if (decl++ < 40) {
+                const ggml_tensor * rows = node->src[1];
+                fprintf(stderr, "IDX_DEC_DECLINE: i=%d nb=%lld rows0=%lld n_nodes=%d next=[", i,
+                        (long long) node->ne[1], (long long) rows->ne[0], cgraph->n_nodes);
+                for (int t = 1; t <= 6 && i + t < cgraph->n_nodes; ++t) {
+                    fprintf(stderr, "%s%s(%lld,%lld)", t > 1 ? " " : "", ggml_op_name(cgraph->nodes[i + t]->op),
+                            (long long) cgraph->nodes[i + t]->ne[0], (long long) cgraph->nodes[i + t]->ne[1]);
+                }
+                fprintf(stderr, "]\n");
+            }
+        }
+        if (fused) {
             if (ggml_cuda_idx_dec_mode() == 2) {
                 m.check = true;
                 m.mm = -1;
@@ -6224,6 +6352,72 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     strixllama_recaptured, strixllama_used ? 100.0 * strixllama_recaptured / strixllama_used : 0.0,
                     cgraph->n_nodes);
         }
+        // strixllama: DOES THE DECODE GRAPH GROW WITH CONTEXT DEPTH?
+        // Every ablation so far prices a NODE, and every node came back at most 0.012 of a 0.0994 ms/1k
+        // GPU slope, while removing all GEMMs left the slope untouched at 0.0995. That combination points
+        // at work that is not a big node: the QSA path appends a strip of nodes per query strip, so if the
+        // decode graph itself has more nodes at 97k than at 17k, the slope is node COUNT - invisible to a
+        // shape-deduped census (same shape, more of them), invisible to KV quantisation (launches, not
+        // cache bytes), and invisible to any single-op ablation (each strip is small).
+        // Flash-attn carries the token count on ne[2] (prefill: thousands, decode: 1, MTP draft: ~21),
+        // which is what separates a decode graph from a prefill one here. Printed once per distinct size.
+        // strixllama: BYTE-RANKED CENSUS OF THE DECODE GRAPH (STRIX_SKIP_DUMP=3).
+        // Every prior attempt ranked decode nodes by SHAPE and filtered to small dims, which is
+        // circular: a depth-scaled tensor is exactly the thing with a big dim, so the filter discarded
+        // the elephant before it could be seen. Rank by BYTES MOVED instead, over the decode graph only
+        // (flash-attn carries the token count on ne[2]: prefill thousands, decode 1, MTP draft ~21).
+        // This answers "what touches O(depth) bytes per token" directly - no ablation, no memset
+        // confound, and no dependence on a node surviving its fusion, which is the hole that made every
+        // SKIP_OPS null uninformative about fused kernels.
+        //
+        // Gated on TOTAL BYTES, not node count: the decode graph was measured to have an identical node
+        // count at 17k and 97k (8404/7972/7936), so any gate on shape or count fires once and hides the
+        // second depth. Bytes are the thing that grows, so they are the thing to key on.
+        //
+        // Bytes are aggregated per KIND (op + shape + name stem) rather than per node: the 12 attention
+        // layers each dispatch a copy of the same op, and a per-node top-20 would just be 20 copies of
+        // one line. The stem drops the trailing -N / _lN layer suffix so layers collapse together.
+        if (getenv("STRIX_SKIP_DUMP") && atoi(getenv("STRIX_SKIP_DUMP")) == 3) {
+            static size_t last_total = 0;
+            int64_t n_tok = -1;
+            for (int i = 0; i < cgraph->n_nodes; ++i) {
+                if (cgraph->nodes[i]->op == GGML_OP_FLASH_ATTN_EXT) { n_tok = cgraph->nodes[i]->ne[2]; break; }
+            }
+            if (n_tok >= 0 && n_tok <= 64) {
+                std::map<std::string, std::pair<size_t, int>> by_kind;
+                size_t total = 0;
+                for (int i = 0; i < cgraph->n_nodes; ++i) {
+                    const ggml_tensor * t = cgraph->nodes[i];
+                    if (ggml_cuda_is_view_or_noop(t)) { continue; }
+                    size_t b = ggml_nbytes(t);
+                    for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                        // ggml_nbytes already returns the COMPRESSED size for a quantized tensor, which
+                        // is the number of bytes actually read - no special case needed.
+                        if (t->src[j]) { b += ggml_nbytes(t->src[j]); }
+                    }
+                    total += b;
+                    char key[192];
+                    snprintf(key, sizeof(key), "%-18s ne=[%lld,%lld,%lld,%lld]", ggml_op_name(t->op),
+                             (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2],
+                             (long long) t->ne[3]);
+                    auto & e = by_kind[key];
+                    e.first += b; e.second += 1;
+                }
+                if (total != last_total) {
+                    last_total = total;
+                    fprintf(stderr, "DECODE_BYTES: n_tok=%lld nodes=%d total=%zu B (%.1f MB) per token\n",
+                            (long long) n_tok, cgraph->n_nodes, total, total / 1048576.0);
+                    std::vector<std::pair<std::string, std::pair<size_t, int>>> agg(by_kind.begin(), by_kind.end());
+                    std::sort(agg.begin(), agg.end(),
+                              [](const std::pair<std::string, std::pair<size_t, int>> & a,
+                                 const std::pair<std::string, std::pair<size_t, int>> & b) { return a.second.first > b.second.first; });
+                    for (size_t k = 0; k < agg.size() && k < 18; ++k) {
+                        fprintf(stderr, "  %10zu B %5d x %s\n", agg[k].second.first, agg[k].second.second,
+                                agg[k].first.c_str());
+                    }
+                }
+            }
+        }
         // once: where the nodes go, since with graphs replaying properly the node COUNT is what a
         // decode step costs (7325 nodes over 48 layers is ~153 per layer)
         static bool strixllama_histogrammed = false;
@@ -6299,6 +6493,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         if (!use_cuda_graph || cuda_graph_update_required) {
             [[maybe_unused]] int prev_i = 0;
             strix_tl_start(cuda_ctx, cgraph, graph_key);
+            // strixllama: no conv state copy left marked from a graph that stopped early (node addresses are reused)
+            ggml_cuda_gdn_conv_tail_reset();
 
             if (stream_ctx.concurrent_events.size() > 0) {
                 should_launch_concurrent_events = true;
@@ -6478,6 +6674,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 if (ggml_cuda_gdn_gather_skip(cgraph, i)) {
                     continue;
                 }
+                // strixllama: a conv state copy the conv's kernel does (ggml_cuda_gdn_conv_match::n_tail)
+                if (ggml_cuda_gdn_conv_tail_skip(node)) {
+                    continue;
+                }
 
                 const ggml_cuda_idx_dec_match strix_pending_before = g_idx_dec_pending;
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
@@ -6566,7 +6766,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 std::vector<std::pair<std::string, std::pair<float, int>>> agg(by_kind.begin(), by_kind.end());
                 std::sort(agg.begin(), agg.end(), [](const auto & a, const auto & b) { return a.second.first > b.second.first; });
                 fprintf(stderr, "NODE_TIMING: graph of %d nodes, %zu dispatches, %.2f ms of GPU time; top kinds:\n", cgraph->n_nodes, rows.size(), total);
-                for (size_t k = 0; k < agg.size() && k < 24; ++k) {
+                // strixllama: the default 24 is fine for "what is big at one depth" but it truncates away
+                // exactly what a DEPTH DIFF needs - a kind that is small yet grows with depth. Raise the
+                // cap so every kind is emitted and the diff over many tokens can see it.
+                static const int top_n = getenv("STRIX_NODE_TIMING_TOP") ? atoi(getenv("STRIX_NODE_TIMING_TOP")) : 24;
+                for (size_t k = 0; k < agg.size() && k < (size_t) top_n; ++k) {
                     fprintf(stderr, "  %8.3f ms %4d x %s\n", agg[k].second.first, agg[k].second.second, agg[k].first.c_str());
                 }
                 // STRIX_NODE_TIMING_LIST=n: the first n dispatches of a graph of more than 1000 tokens' rows, in order
@@ -6631,6 +6835,23 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         if (cuda_graph_update_required) { // Update graph executable
             ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
         }
+        // strixllama: WHICH graph does a decode token actually replay?
+        // The dispatch loop - and therefore STRIX_SKIP_OPS - runs only at CAPTURE time, so a node that
+        // lives inside an already-captured graph is invisible to every ablation: SKIP_HIT proves the
+        // capture engaged, not what a token executes. That is why the indexer-chain ablations all read
+        // ~0 while the depth slope stayed 0.099 ms/1k through eight runs. Counting launches per graph,
+        // tagged with the graph's node count, names the graph that decode actually replays and whether
+        // it is the one carrying the full block-key rebuild (48 CONT + 36 ADD at ne=[128,n_blocks]).
+        if (getenv("STRIX_SKIP_DUMP") && atoi(getenv("STRIX_SKIP_DUMP")) == 4) {
+            static std::map<const void *, std::pair<long long, int>> rep;
+            auto & e = rep[graph_key];
+            e.first++;
+            e.second = cgraph->n_nodes;
+            if (e.first == 5 || e.first == 50 || e.first == 500) {   // one line per graph per milestone
+                fprintf(stderr, "GRAPH_REPLAY: key=%p nodes=%d launches=%lld\n",
+                        graph_key, cgraph->n_nodes, e.first);
+            }
+        }
         // Launch graph
         CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
 #else
@@ -6659,7 +6880,9 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 
 static void strix_ab_step(const ggml_cgraph * cgraph) {
     static const int every = getenv("STRIX_AB") ? atoi(getenv("STRIX_AB")) : 0;
-    if (every <= 0 || cgraph->n_nodes < 64 || ggml_nrows(cgraph->nodes[0]) >= 64) {
+    // STRIX_AB_MIN_NODES=n: only graphs of at least n nodes count (with MTP: the verify passes, a step apart)
+    static const int min_nodes = getenv("STRIX_AB_MIN_NODES") ? atoi(getenv("STRIX_AB_MIN_NODES")) : 64;
+    if (every <= 0 || cgraph->n_nodes < min_nodes || ggml_nrows(cgraph->nodes[0]) >= 64) {
         return;
     }
     // the wall time from one decode graph's compute to the next, by side (a whole step for one conversation without

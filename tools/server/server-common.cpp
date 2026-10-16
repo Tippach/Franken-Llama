@@ -1553,6 +1553,9 @@ json oaicompat_chat_params_parse(
             llama_params["reasoning_budget_end_tags"] = chat_params.thinking_end_tags;
             llama_params["reasoning_budget_message"] = json_value(body, "reasoning_budget_message", opt.reasoning_budget_message);
             llama_params["reasoning_control"] = json_value(body, "reasoning_control", false);
+            // strixllama: the loop breaker needs the thinking markers to know which channel it is
+            // guarding, so it rides along with them. without markers it still guards the answer.
+            llama_params["loop_breaker"] = json_value(body, "loop_breaker", opt.loop_breaker);
         }
     }
 

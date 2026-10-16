@@ -216,6 +216,24 @@ bool llama_memory_hybrid_idx::kb_needs_full(const llama_ubatch & ubatch) const {
     if (!ubatch.seq_id || !ubatch.n_seq_id) {
         return false;
     }
+    // strixllama: STRIXLLAMA_KB_NOFULL=1 forces the incremental branch always, so the full block-key
+    // rebuild graph is never captured. TIMING EXPERIMENT ONLY - block keys go stale, so selection and
+    // text are wrong; it exists to price the rebuild, which no node ablation can reach (the chain is
+    // swallowed by a fusion at capture, so SKIP_OPS never sees a node to skip: CONT@128/ADD@128 give
+    // SKIP_HIT=0 while the byte census shows 48 CONT + 36 ADD at ne=[128,n_blocks] in the replayed
+    // 7936-node decode graph). If the depth slope collapses with this on, the per-token rebuild of all
+    // n_blocks keys is the slope, and the fix is Bubo's: pool only the blocks a step completes.
+    static const bool kb_nofull = getenv("STRIXLLAMA_KB_NOFULL") && atoi(getenv("STRIXLLAMA_KB_NOFULL"));
+    if (kb_nofull) {
+        return false;
+    }
+    // strixllama: STRIXLLAMA_KB_DBG=1 names WHY a graph takes the full-rebuild branch. The decode
+    // graph was measured (STRIX_SKIP_DUMP=3 byte census) to contain build_block_keys at
+    // nb_out = n_blocks - 48 CONT + 36 ADD at ne=[128,24320] at 97k - i.e. every token rebuilds
+    // every block key, which is O(depth) per token and the whole depth slope. Bubo pools only the
+    // blocks a step completes (PoolIndexerBlocks) and never re-materialises the array. This prints
+    // the trigger (stale bit vs pending overflow) so the fix targets the real cause.
+    static const bool kb_dbg = getenv("STRIXLLAMA_KB_DBG") && atoi(getenv("STRIXLLAMA_KB_DBG"));
     constexpr llama_pos none = std::numeric_limits<llama_pos>::max();
     bool pending = false;
     for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
@@ -225,6 +243,7 @@ bool llama_memory_hybrid_idx::kb_needs_full(const llama_ubatch & ubatch) const {
                 continue;
             }
             if (kb_stale.test(s)) {
+                if (kb_dbg) { fprintf(stderr, "KB_FULL: reason=stale seq=%d n_tok=%u\n", (int) s, ubatch.n_tokens); }
                 return true;
             }
             pending |= kb_from[s] != none;
@@ -247,6 +266,8 @@ bool llama_memory_hybrid_idx::kb_needs_full(const llama_ubatch & ubatch) const {
     }
     for (const auto & [s, r] : own) {
         if (kb_pending_extra(s, r.first, r.second) > kb_pending_max) {
+            if (kb_dbg) { fprintf(stderr, "KB_FULL: reason=pending seq=%d extra=%lld n_tok=%u\n",
+                                (int) s, (long long) kb_pending_extra(s, r.first, r.second), ubatch.n_tokens); }
             return true;
         }
     }
@@ -833,7 +854,21 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
     // graph gate stops wiring the cache in (and can_reuse rebuilds any graph built before the restore without
     // it). Per-sequence, and NOT the global kb_dup: kb_dup also caps the ubatch for the dense-input budget, which
     // a plain text restore does not need and which would tank prefill at long context. Sticky, like the image case.
-    if (seq_id >= 0 && seq_id < LLAMA_MAX_SEQ) {
+    // strixllama R2 (STRIXLLAMA_KB_RESTORE=1): the blanket disable above is over-conservative for the common
+    // case. What actually breaks the cache is cells that are NOT dense from position 0, because then a cell's
+    // block index is its rank rather than pos/r and the fill path asserts !ranked. A full kv-chain restore
+    // tiles [0, n) contiguously (chunk 0 at pos_lo=0, later chunks APPEND), so the sequence stays dense from 0
+    // and the cache tracks it fine - measured: forcing the cache through such a restore is bit-identical and
+    // saves 11.53 ms/tok at 131k (slope_investigation_log.md C18/C19). A genuine mid-chain replay starts at
+    // pos_min > 0 and still gets disabled. Decided AFTER the cells are placed, below; with the gate OFF this
+    // is byte-identical to the historical behaviour (always disable).
+    // PROMOTED 2026-10-16 (default ON): STRIXLLAMA_KB_RESTORE=0 restores the old blanket disable. Measured
+    // on the shipping config: d131k 31.30 -> 36.64 t/s, fair decay 43.9% -> 16.9%, output bit-identical
+    // through a kv-chain restore in both AR and MTP (slope_investigation_log.md C19-C21). Note this var is
+    // NOT wiped by the server's env-bake (STRIXLLAMA_ does not match ^STRIX_), so the default lives here
+    // rather than in the launcher, and the escape hatch works from a plain environment.
+    static const bool kb_restore_ok = !getenv("STRIXLLAMA_KB_RESTORE") || atoi(getenv("STRIXLLAMA_KB_RESTORE")) != 0;
+    if (!kb_restore_ok && seq_id >= 0 && seq_id < LLAMA_MAX_SEQ) {
         kb_seq_off.set(seq_id);
     }
     // note: repeats llama_memory_hybrid::state_read
@@ -889,6 +924,22 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
         state_drop(seq_id);
 
         throw;
+    }
+
+    // strixllama R2: decide the cache flag now that the cells are actually placed. What the fill path needs is
+    // a sequence whose cells are dense from position 0, so that a cell's block index is pos/r and not its
+    // rank. A full kv-chain restore tiles [0, n) contiguously across its APPEND chunks, so pos_min stays 0
+    // and the cache tracks it; a genuine mid-chain replay leaves pos_min > 0 and must stay disabled. The
+    // density assumption (no interior gaps) is the same one kb_window_blocks already makes at n_cells =
+    // p1 - p0 + 1, so this adds no new assumption to the file. kb_mark_stale above still forces exactly one
+    // correct full rebuild for the restored cells, so the keys the cache serves afterwards are fresh.
+    if (kb_restore_ok && seq_id >= 0 && seq_id < LLAMA_MAX_SEQ) {
+        const llama_pos pmin = get_mem_attn()->seq_pos_min(seq_id);
+        if (pmin == 0) {
+            kb_seq_off.reset(seq_id);
+        } else {
+            kb_seq_off.set(seq_id);
+        }
     }
 
     // strixllama: diagnostic - after a mirror restore the two caches must hold the same cells for the sequence.
@@ -1303,6 +1354,24 @@ bool llama_memory_hybrid_idx::set_input_qsa_run(qsa_run_inputs & out, ggml_tenso
             }
         }
         std::fill(out.bid_rows.begin() + n_bid, out.bid_rows.end(), scratch);
+        // strixllama: TEST-ONLY fault injection (mirrors STRIXLLAMA_LB_FAULT). STRIXLLAMA_KB_FAULT=N makes the
+        // LAST N completed blocks gather the SCRATCH row's key instead of their own, so their indexer score is
+        // wrong and the block selection - and the text - MUST change. The last blocks are the most recent, which
+        // a "summarise the context" query almost always attends to, so the corruption is guaranteed to be in the
+        // attended set (corrupting the first blocks can miss the top-k entirely and read as a false blind gate).
+        // This is the NEGATIVE CONTROL for the bit-identity gate (_idx_gate.ps1 -Mode negative): every shipped
+        // indexer knob is bit-preserving by construction, so none can prove the gate watches the gathered keys.
+        // If the text is identical under this injection the gate is blind and cannot certify anything. In-bounds:
+        // scratch is a real row. Never set in production.
+        static const int kb_fault = getenv("STRIXLLAMA_KB_FAULT") ? atoi(getenv("STRIXLLAMA_KB_FAULT")) : 0;
+        if (kb_fault > 0) {
+            const int64_t nf = std::min<int64_t>(kb_fault, n_bid);
+            for (int64_t b = n_bid - nf; b < n_bid; ++b) {
+                out.bid_rows[b] = scratch;
+            }
+            static bool once1 = false;
+            if (!once1) { once1 = true; fprintf(stderr, "KB_FAULT site1 (out.bid_rows): nf=%lld n_bid=%lld n_blocks=%lld\n", (long long) nf, (long long) n_bid, (long long) n_blocks); }
+        }
     }
     if (kb && kb->dirty_dst && kb->dirty_dst->data) {
         const int64_t dirty_max = kb->dirty_dst->ne[0];
@@ -1873,6 +1942,17 @@ void llama_memory_hybrid_idx::set_input_qsa_scan(
             int32_t * br = (int32_t *) kb->bid_rows->data;
             for (int64_t b = 0; b < n_blocks; ++b) {
                 br[b] = b < n_bid ? (int32_t) kb_row(kv_off + bid_cell[b]) : scratch;
+            }
+            // strixllama: TEST-ONLY fault injection, same as site1. This is the fill path the DECODE graph
+            // actually uses (writes kb->bid_rows->data directly), which is why site1 alone read blind.
+            static const int kb_fault2 = getenv("STRIXLLAMA_KB_FAULT") ? atoi(getenv("STRIXLLAMA_KB_FAULT")) : 0;
+            if (kb_fault2 > 0) {
+                const int64_t nf = std::min<int64_t>(kb_fault2, n_bid);
+                for (int64_t b = n_bid - nf; b < n_bid; ++b) {
+                    br[b] = scratch;
+                }
+                static bool once2 = false;
+                if (!once2) { once2 = true; fprintf(stderr, "KB_FAULT site2 (bid_rows->data): nf=%lld n_bid=%lld n_blocks=%lld\n", (long long) nf, (long long) n_bid, (long long) n_blocks); }
             }
         }
         // the dirty list exists only in incremental graphs (a full-rebuild graph reads no such input)

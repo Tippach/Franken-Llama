@@ -120,6 +120,12 @@ uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 // force the reasoning budget sampler (if any) to begin forcing its end sequence now.
 bool common_sampler_reasoning_budget_force(struct common_sampler * gsmpl);
 
+// strixllama: take a pending loop-breaker request: 0 = nothing, 1 = close the thinking span,
+// 2 = end the generation. The sampler cannot act on these itself - it only chooses among the
+// candidates it is handed, and end-of-turn / </think> are frequently not among them because the
+// caller pre-filters the candidate set. Returns 0 when the loop breaker is not enabled.
+int common_sampler_loop_breaker_request(struct common_sampler * gsmpl);
+
 // helpers
 
 // access the internal list of current candidate tokens

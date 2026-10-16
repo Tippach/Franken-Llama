@@ -37,8 +37,23 @@
 //   reused   ubatches that hit the graph-reuse path, out of ubatches in this call
 //
 // Everything but `compute` is CPU orchestration. Off by default; one static bool per call site when off.
+//
+//   STRIXLLAMA_DT_SYNC=1 makes that last line true. graph_compute submits asynchronously
+//   (ggml_backend_sched_graph_compute_async) and returns as soon as the queue is handed to the driver, so
+//   with the default the GPU is still running when dt_t3 is taken: `compute` is submit-only and `total`
+//   under-reads real per-token time by however much the backend has not finished (measured: DT total
+//   8.3 ms/tok at 262k against a server eval time of ~46 ms/tok, i.e. blind to ~38 ms/tok of GPU). The
+//   drain lands in `post` on the logits readback, or after llama_decode returns entirely.
+//
+//   With the knob on, the sched is synchronized before dt_t3, so `compute` is submit + full GPU wait and
+//   `total` should track the server's own eval time -- that is the check that the instrument works. CUDA
+//   graphs stay ON: this measures the shipping replay path, unlike STRIX_NODE_TIMING, which forces
+//   GGML_CUDA_DISABLE_GRAPHS=1 and so prices launch overhead instead of kernels. The sync itself is a
+//   fixed per-token cost that does not grow with context depth, so depth differences stay valid.
 struct strixllama_decode_timing {
     static bool enabled() { static const bool e = getenv("STRIX_DECODE_TIMING") && atoi(getenv("STRIX_DECODE_TIMING")); return e; }
+    // only consulted when enabled(), so a DT-off run never reads it
+    static bool sync_gpu() { static const bool s = getenv("STRIXLLAMA_DT_SYNC") && atoi(getenv("STRIXLLAMA_DT_SYNC")); return s; }
     int64_t prep = 0, graph = 0, inputs = 0, compute = 0;
     int n_ubatch = 0, n_reused = 0;
     void reset() { prep = graph = inputs = compute = 0; n_ubatch = n_reused = 0; }
@@ -120,6 +135,9 @@ llama_context::llama_context(
     // TODO warning when creating llama_context with awkward ctx size that is not a power of 2,
     //     may need to be backend-dependent
     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
+
+    // strixllama: an MTP draft context skips the target's image batches, so its positions jump over them
+    balloc->allow_pos_jumps = params.ctx_type == LLAMA_CONTEXT_TYPE_MTP;
 
     t_start_us = model.t_start_us;
     t_load_us  = model.t_load_us;
@@ -1525,6 +1543,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     const int64_t dt_t2 = dt ? ggml_time_us() : 0;
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (dt && strixllama_decode_timing::sync_gpu()) {
+        // drain the queue so `compute` below is real GPU wall time on the replay path, not submit time.
+        // deliberately not llama_context::synchronize(): that also kicks the PLE disk gather, which is
+        // extra work the shipping path would not have done here and would show up as fake GPU time.
+        ggml_backend_sched_synchronize(sched.get());
+    }
     if (dt) {
         const int64_t dt_t3 = ggml_time_us();
         g_decode_timing.graph   += dt_t1 - dt_t0;

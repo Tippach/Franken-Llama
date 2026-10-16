@@ -3771,6 +3771,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_THINK_BUDGET_MESSAGE"));
     add_opt(common_arg(
+        {"--loop-breaker"},
+        {"--no-loop-breaker"},
+        "detect token loops in thinking / answer and break them: nudge the temperature, then force "
+        "the thinking block closed or end generation (default: disabled)\n",
+        [](common_params & params, bool value) {
+            params.sampling.loop_breaker = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_LOOP_BREAKER"));
+    add_opt(common_arg(
+        {"--loop-breaker-nudge"}, "N",
+        "amount added to the effective temperature while the loop breaker is nudging (default: 0.5)",
+        [](common_params & params, const std::string & value) {
+            params.sampling.loop_breaker_nudge = std::stof(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_LOOP_BREAKER_NUDGE"));
+    add_opt(common_arg(
         {"--reasoning-preserve"},
         {"--no-reasoning-preserve"},
         "preserve reasoning trace in the full history, not just the last assistant message (default: enabled)\n"

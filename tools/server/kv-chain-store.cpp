@@ -399,6 +399,9 @@ void kv_chain_store::begin_prompt() {
     flush();
     running_fp_     = root_hash_;
     boundary_index_ = 0;
+    // before any block is handled the fp a block would be named with is the root; that is also the right
+    // answer for a prompt too short to reach the hook, so entry_fp_used() is never a stale value.
+    last_entry_fp_  = root_hash_;
 }
 
 // tail-stride: the tail is last-write-wins and constant-size, so on off-stride
@@ -426,6 +429,10 @@ bool kv_chain_store::save(llama_context * ctx, llama_seq_id seq_id, llama_pos po
     // the file name binds the input hash AND the running fp: a chunk whose content
     // matches but whose KV state differs (a different preceding image) has a
     // different name, so it is a clean miss -- no header read to reject it.
+    // strixllama: remember the fp this block's name is about to be built on. Everything the pipeline does
+    // above has already run, so this IS the fingerprint of the whole prefix before this block -- the one
+    // value a live resume has to reproduce in order to name this block's successor the same way.
+    last_entry_fp_ = running_fp_;
     const fs::path dir  = fs::path(root_dir);
     const fs::path file = dir / (chunk_key_str(chunk_hash, running_fp_) + ".kvcache");
     if (fs::exists(file)) {
@@ -590,6 +597,10 @@ void kv_chain_store::fold_glue(llama_context * ctx, llama_seq_id seq_id, llama_p
     // publish any pending chunk first so running_fp_ is current before folding glue on top.
     (void) reap_pending_write();
     (void) publish_pending_copies();
+
+    // strixllama: same reason as in save(): this is the fingerprint of everything before this block, and
+    // the one a live resume must reproduce in order to name its first new chunk the way a cold run would.
+    last_entry_fp_ = running_fp_;
 
     const size_t attn_size =
         llama_state_seq_get_size_window_ext(ctx, seq_id, LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY, pos_lo, pos_hi);

@@ -380,6 +380,13 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
     add((new field_bool("reasoning_control", params.sampling.reasoning_control))
         ->set_desc("Create the budget sampler on demand so reasoning can be ended at runtime"));
 
+    // strixllama: loop breaker (see common/loop-breaker.h). Like reasoning_control/reasoning_budget,
+    // the default here is the task default; the server-wide default from --loop-breaker is injected
+    // into the request in oaicompat_completion_params_parse (server-common.cpp), so chat requests
+    // inherit the launcher's setting while a raw /completions body opts in per request.
+    add((new field_bool("loop_breaker", params.sampling.loop_breaker))
+        ->set_desc("Detect token loops in thinking / answer and break them"));
+
     add((new field_num("reasoning_budget_tokens", params.sampling.reasoning_budget_tokens))
         ->set_hard_limits(-1, INT32_MAX)
         ->set_desc("Number of tokens in the reasoning budget (-1 = disabled)"));

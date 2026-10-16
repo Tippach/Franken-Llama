@@ -142,7 +142,12 @@ void ggml_cuda_op_idx_score(ggml_backend_cuda_context & ctx, const ggml_cuda_idx
 // partials by butterfly (offsets 16, 8, 4, 2, 1: lane 0 ends with ((((p0 + p16) + (p8 + p24)) + ...)), and the two waves' sums
 // are reduced again by butterfly with zeros in the other lanes, (w0 + 0) + (w1 + 0). Here one thread takes a key and spells that
 // tree out, so the scores are the chain's, bit for bit. `zero` is 0.0f, passed in so those additions stay in the code.
+//
+// strixllama DEV: overridable so a compile-only resource A/B can test whether the query staging limits
+// occupancy. Plain decode runs nq = 1, but qsh is sized for 8 queries in both kernels.
+#ifndef IDXD_MAXQ
 #define IDXD_MAXQ 8
+#endif
 
 static __device__ __forceinline__ float idxd_partial(const half2 k, const float * __restrict__ q) {
     const float2 kx = __half22float2(k);
@@ -157,7 +162,33 @@ static __device__ __forceinline__ float idxd_wave(const half2 * __restrict__ k, 
     float a[16];
     // strixllama: unroll 4, not all 16. The a[i] are independent, so this reorders nothing and the scores are the same
     // bits, but the compiler no longer keeps a whole wave's worth of q live beside k[32] and a[16].
+    //
+    // STRIXLLAMA_IDXD_FULLUNROLL=1 re-tests that choice. MEASURED NULL (2026-10-15, codegen A/B with
+    // -Rpass-analysis=kernel-resource-usage, object hashed to prove the flag changed codegen):
+    //   base (unroll 4): VGPRs 40, Scratch 132 B/lane, occupancy 14 waves/SIMD
+    //   full unroll    : VGPRs 256, Scratch 628 B/lane, occupancy  5 waves/SIMD   <- strictly worse
+    // So the 132 B/lane scratch is NOT caused by the partial unroll, and the old spill story (256 VGPRs,
+    // 156 B spill) no longer describes this kernel either: spill is 0 in both. The unroll-4 stays.
+    //
+    // WHY the scorer is slow (the arithmetic, corrected 2026-10-15 - an earlier version of this note said
+    // 300 MB and "82% of roofline", which was wrong and wrongly closed the lever): at 97k the chain reads
+    // 12 attn layers x 24320 blocks x 128 dims x 2 B = 71.3 MB of block keys per token (12.8 MB at 17k).
+    // The repeat prices the chain at 1.856 ms/token at 97k, i.e. 37.5 GB/s - only 19% of this box's
+    // 195.4 GB/s roofline. So the kernel is 5x off roofline and there is a real ~0.019 ms/1k (~19% of the
+    // slope) to recover WITHOUT changing a single bit of the scores.
+    //
+    // The limiter is static shared memory, not registers: qsh is sized for IDXD_MAXQ = 8 queries
+    // (4 * 8 * 132 floats = 16896 B/block, reported LDS 16960) but plain decode runs nq = 1 and needs
+    // 4 * 1 * 132 = 2112 B. At 16960 B/block a CU fits only ~3 blocks, so the grid streams far fewer
+    // concurrent blocks than the machine can host and the key reads never saturate DRAM. A decode variant
+    // with the query staging sized for the actual nq raises occupancy with identical arithmetic: qsh is
+    // only a staging buffer for q, every dot product and every addition order is unchanged, so the scores
+    // are the same bits. Gate: -Mode verify (bit-identical) + the no-draft slope re-price.
+#ifdef STRIXLLAMA_IDXD_FULLUNROLL
+#pragma unroll
+#else
 #pragma unroll 4
+#endif
     for (int i = 0; i < 16; ++i) {
         a[i] = idxd_partial(k[i], q + 2 * i) + idxd_partial(k[i + 16], q + 2 * (i + 16));
     }
@@ -367,6 +398,260 @@ static __global__ void __launch_bounds__(256) k_idx_score_dec3(const half * __re
     }
 }
 
+// strixllama: variant 4 - variant 3 with the query staging buffer sized for the ACTUAL query count.
+//
+// REGISTER-STAGING THE KEY IS A MEASURED DEAD END (2026-10-15). The obvious reading of v3's report (VGPRs 40,
+// Scratch 132 B/lane, Spill 0) is that half2 k[32] = 128 B overflows 40 VGPRs and so lives in local memory,
+// re-read by every head of every query - a 5x traffic amplification pinning the kernel at ~40 GB/s. An
+// earlier v4 staged the key as 8 uint4 and read it only through COMPILE-TIME indices (a recursive template,
+// since a loop counter cannot be a template argument even under #pragma unroll) so mem2reg could keep it in
+// registers. Codegen refutes it: keeping the key addressable-free needs the first loop FULLY unrolled, and
+// the full unroll is the very thing that explodes registers - VGPRs 256, Scratch 628, VGPRs Spill 156,
+// occupancy 5 waves/SIMD, strictly worse than v3 on every axis. Register-staging and full-unroll are
+// inseparable here, so the scratch cannot be removed this way. That hypothesis is closed.
+//
+// The real limiter is static shared memory (see idxd_wave's note): qsh is sized for IDXD_MAXQ = 8 queries
+// (4 * 8 * 132 floats = 16896 B, reported LDS 16960 B/block), but plain decode runs nq = 1 and needs only
+// 4 * 1 * 132 = 2112 B. At 16960 B a CU hosts only ~3 blocks, so the grid streams far fewer concurrent
+// blocks than the machine can hold and the key reads never saturate DRAM. Here qsh is DYNAMIC shared memory
+// sized 4 * nq * IDXD3_TS at launch, with the runtime stride hs = nq * IDXD3_TS used identically at the one
+// write site and the one read site. qsh is only a staging buffer: every element is read back exactly where it
+// was written, so the layout is free to change and every dot product and addition order is untouched - the
+// scores are the same bits. The key stays half2 k[32] and idxd_wave stays unroll-4, so VGPRs/Scratch match v3
+// (40 / 132) and only LDS drops. Verified by STRIX_IDX_SCORE_DEC=2 (fused vs unfused) and the bit-identity gate.
+static __global__ void __launch_bounds__(256) k_idx_score_dec4(const half * __restrict__ kb, const int64_t kbs,
+        const int32_t * __restrict__ rows, const int nb, const float * __restrict__ q, const int64_t qs, const int nq,
+        const int32_t * __restrict__ starts, const int32_t * __restrict__ tails, float * __restrict__ out, const float zero,
+        const float * __restrict__ seq_blk, const float * __restrict__ seq_tok, const int n_slots) {
+    extern __shared__ float qsh[];
+    const int hs = nq * IDXD3_TS;   // runtime stand-in for IDXD3_HS, sized to the real query count
+    __shared__ uint32_t tok_mask[IDXD_MAXQ];
+    __shared__ int32_t tail_sh[IDXD_MAXQ];
+    const bool use_mask = seq_blk != nullptr && n_slots <= 32;
+    for (int i = threadIdx.x; i < nq * 4 * 128; i += blockDim.x) {
+        const int r = i / 128, c = i % 128;
+        qsh[(r % 4) * hs + (r / 4) * IDXD3_TS + (c / 64) * 66 + c % 64] = q[(int64_t) r * qs + c];
+    }
+    if (threadIdx.x < (unsigned) nq) {
+        tail_sh[threadIdx.x] = tails[threadIdx.x];
+        if (use_mask) {
+            uint32_t m = 0;
+            for (int sl = 0; sl < n_slots; ++sl) {
+                m |= (seq_tok[(int64_t) threadIdx.x * n_slots + sl] > 0.5f ? 1u : 0u) << sl;
+            }
+            tok_mask[threadIdx.x] = m;
+        }
+    }
+    __syncthreads();
+    const int w = threadIdx.x & 1;
+    const int b = (blockIdx.x * blockDim.x + threadIdx.x) >> 1;
+    const bool valid = b < nb;
+    uint32_t blk_mask = 0;
+    if (valid && use_mask) {
+        for (int sl = 0; sl < n_slots; ++sl) {
+            blk_mask |= (seq_blk[(int64_t) b * n_slots + sl] > 0.5f ? 1u : 0u) << sl;
+        }
+    }
+    half2 k[32];
+    if (valid) {
+        const uint4 * kp = (const uint4 *) (kb + (int64_t) rows[b] * kbs + 64 * w);
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const uint4 v = kp[i];
+            k[4 * i + 0] = __builtin_bit_cast(half2, v.x);
+            k[4 * i + 1] = __builtin_bit_cast(half2, v.y);
+            k[4 * i + 2] = __builtin_bit_cast(half2, v.z);
+            k[4 * i + 3] = __builtin_bit_cast(half2, v.w);
+        }
+    } else {
+#pragma unroll
+        for (int i = 0; i < 32; ++i) { k[i] = __builtin_bit_cast(half2, 0u); }
+    }
+    const int st = valid ? starts[b] : 0;
+    uint32_t vis_bits = 0;
+    for (int t = 0; t < nq; ++t) {
+        bool vis = valid && tail_sh[t] > st;
+        if (vis && seq_blk) {
+            if (use_mask) {
+                vis = (blk_mask & tok_mask[t]) != 0;
+            } else {
+                float m = 0.0f;
+                for (int sl = 0; sl < n_slots; ++sl) {
+                    m += seq_blk[(int64_t) b * n_slots + sl] * seq_tok[(int64_t) t * n_slots + sl];
+                }
+                vis = m > 0.5f;
+            }
+        }
+        if (vis) {
+            vis_bits |= 1u << t;
+        } else if (valid && w == 0) {
+            out[(int64_t) t * nb + b] = -INFINITY;
+        }
+    }
+    while (__any(vis_bits != 0)) {
+        const bool active = vis_bits != 0;
+        const int t = active ? __ffs(vis_bits) - 1 : 0;
+        vis_bits &= vis_bits - 1;
+        float acc = 0.0f;
+#pragma unroll
+        for (int h = 0; h < 4; ++h) {
+            const float mine  = idxd_wave(k, qsh + h * hs + t * IDXD3_TS + 66 * w);
+            const float other = __shfl_xor_sync(0xffffffff, mine, 1, 32);
+            const float w0 = w == 0 ? mine : other, w1 = w == 0 ? other : mine;
+            const float v = (w0 + zero) + (w1 + zero);
+            const float r = fmaxf(v, 0.0f);
+            acc = h == 0 ? r : acc + r;
+        }
+        if (active && w == 0) {
+            out[(int64_t) t * nb + b] = acc + zero;
+        }
+    }
+}
+
+// strixllama: variant 5 = variant 4 with the block key held in REGISTERS instead of local memory.
+//
+// v4 (dynamic qsh) is BIT-IDENTICAL (gate: 36/36 v4 banners, hash equal) and a CLEAN NULL on time (slope
+// saved 0.0004 ms/1k, treatment engaged: 40/40 banners v4). So the kernel is NOT LDS-occupancy-bound and
+// the static-qsh story is closed. What v4 deliberately did NOT touch is the 132 B/lane scratch: half2 k[32]
+// is 128 B and cannot live in 40 VGPRs, so it sits in local memory and every head of every query re-reads
+// it - ~640 B of scratch traffic per 128 B of useful key read. At 97k that is ~374 MB of scratch against
+// 71 MB of keys per token, the best remaining explanation for the kernel's 37.5 GB/s (19% of the
+// 195.4 GB/s roofline).
+//
+// TWO register-staging attempts failed for the SAME two reasons, now understood:
+//   (1) full unroll of the 16-partial loop -> VGPRs 256, Spill 156, occupancy 5;
+//   (2) group-of-4 via a helper taking `float * a` -> identical 256/159/5. Passing a[] by pointer makes it
+//       ADDRESS-TAKEN, so the compiler puts a[16] in local memory regardless, and an unrolled head loop
+//       expands 4 heads x 16 partials at once. Register pressure is structural, not about the k indices.
+//
+// The correct schedule keeps k in registers with BOUNDED liveness: load uint4 kv[8] ONCE (the only memory
+// read of the key - no per-head scratch re-read), then run the head loop with a RUNTIME (non-unrolled)
+// index so only ONE head's a[16] is live at a time. a[] is written with compile-time indices but NEVER
+// passed by pointer, so it stays register-allocatable. kv (32 VGPRs) + one a[16] (16 VGPRs) + q/masks is
+// ~60-70 VGPRs, not 256. Same 32 half2 values, same idxd_partial calls in the same order, same butterfly,
+// same head-sum order: the scores are the same bits. Codegen gate before any GPU time: VGPRs must stay
+// under ~96 with Spill 0 and Scratch near 0; if it still explodes, register-staging is closed for good.
+template <int J>
+static __device__ __forceinline__ half2 idxd_kreg(const uint4 * kv) {
+    const unsigned u = (J & 3) == 0 ? kv[J >> 2].x : (J & 3) == 1 ? kv[J >> 2].y : (J & 3) == 2 ? kv[J >> 2].z : kv[J >> 2].w;
+    return __builtin_bit_cast(half2, u);
+}
+
+// one wave's butterfly over the register-staged key. q is a runtime-offset pointer (head t's slice), the
+// 2*J offsets are compile-time. a[16] is a local written by constant index and never address-taken.
+static __device__ __forceinline__ float idxd_wave_reg(const uint4 * __restrict__ kv, const float * __restrict__ q) {
+    float a[16];
+    a[0]  = idxd_partial(idxd_kreg<0>(kv),  q + 0)  + idxd_partial(idxd_kreg<16>(kv), q + 32);
+    a[1]  = idxd_partial(idxd_kreg<1>(kv),  q + 2)  + idxd_partial(idxd_kreg<17>(kv), q + 34);
+    a[2]  = idxd_partial(idxd_kreg<2>(kv),  q + 4)  + idxd_partial(idxd_kreg<18>(kv), q + 36);
+    a[3]  = idxd_partial(idxd_kreg<3>(kv),  q + 6)  + idxd_partial(idxd_kreg<19>(kv), q + 38);
+    a[4]  = idxd_partial(idxd_kreg<4>(kv),  q + 8)  + idxd_partial(idxd_kreg<20>(kv), q + 40);
+    a[5]  = idxd_partial(idxd_kreg<5>(kv),  q + 10) + idxd_partial(idxd_kreg<21>(kv), q + 42);
+    a[6]  = idxd_partial(idxd_kreg<6>(kv),  q + 12) + idxd_partial(idxd_kreg<22>(kv), q + 44);
+    a[7]  = idxd_partial(idxd_kreg<7>(kv),  q + 14) + idxd_partial(idxd_kreg<23>(kv), q + 46);
+    a[8]  = idxd_partial(idxd_kreg<8>(kv),  q + 16) + idxd_partial(idxd_kreg<24>(kv), q + 48);
+    a[9]  = idxd_partial(idxd_kreg<9>(kv),  q + 18) + idxd_partial(idxd_kreg<25>(kv), q + 50);
+    a[10] = idxd_partial(idxd_kreg<10>(kv), q + 20) + idxd_partial(idxd_kreg<26>(kv), q + 52);
+    a[11] = idxd_partial(idxd_kreg<11>(kv), q + 22) + idxd_partial(idxd_kreg<27>(kv), q + 54);
+    a[12] = idxd_partial(idxd_kreg<12>(kv), q + 24) + idxd_partial(idxd_kreg<28>(kv), q + 56);
+    a[13] = idxd_partial(idxd_kreg<13>(kv), q + 26) + idxd_partial(idxd_kreg<29>(kv), q + 58);
+    a[14] = idxd_partial(idxd_kreg<14>(kv), q + 28) + idxd_partial(idxd_kreg<30>(kv), q + 60);
+    a[15] = idxd_partial(idxd_kreg<15>(kv), q + 30) + idxd_partial(idxd_kreg<31>(kv), q + 62);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) { a[i] = a[i] + a[i + 8]; }
+#pragma unroll
+    for (int i = 0; i < 4; ++i) { a[i] = a[i] + a[i + 4]; }
+#pragma unroll
+    for (int i = 0; i < 2; ++i) { a[i] = a[i] + a[i + 2]; }
+    return a[0] + a[1];
+}
+
+static __global__ void __launch_bounds__(256) k_idx_score_dec5(const half * __restrict__ kb, const int64_t kbs,
+        const int32_t * __restrict__ rows, const int nb, const float * __restrict__ q, const int64_t qs, const int nq,
+        const int32_t * __restrict__ starts, const int32_t * __restrict__ tails, float * __restrict__ out, const float zero,
+        const float * __restrict__ seq_blk, const float * __restrict__ seq_tok, const int n_slots) {
+    extern __shared__ float qsh[];
+    const int hs = nq * IDXD3_TS;
+    __shared__ uint32_t tok_mask[IDXD_MAXQ];
+    __shared__ int32_t tail_sh[IDXD_MAXQ];
+    const bool use_mask = seq_blk != nullptr && n_slots <= 32;
+    for (int i = threadIdx.x; i < nq * 4 * 128; i += blockDim.x) {
+        const int r = i / 128, c = i % 128;
+        qsh[(r % 4) * hs + (r / 4) * IDXD3_TS + (c / 64) * 66 + c % 64] = q[(int64_t) r * qs + c];
+    }
+    if (threadIdx.x < (unsigned) nq) {
+        tail_sh[threadIdx.x] = tails[threadIdx.x];
+        if (use_mask) {
+            uint32_t m = 0;
+            for (int sl = 0; sl < n_slots; ++sl) {
+                m |= (seq_tok[(int64_t) threadIdx.x * n_slots + sl] > 0.5f ? 1u : 0u) << sl;
+            }
+            tok_mask[threadIdx.x] = m;
+        }
+    }
+    __syncthreads();
+    const int w = threadIdx.x & 1;
+    const int b = (blockIdx.x * blockDim.x + threadIdx.x) >> 1;
+    const bool valid = b < nb;
+    uint32_t blk_mask = 0;
+    if (valid && use_mask) {
+        for (int sl = 0; sl < n_slots; ++sl) {
+            blk_mask |= (seq_blk[(int64_t) b * n_slots + sl] > 0.5f ? 1u : 0u) << sl;
+        }
+    }
+    uint4 kv[8];
+    if (valid) {
+        const uint4 * kp = (const uint4 *) (kb + (int64_t) rows[b] * kbs + 64 * w);
+#pragma unroll
+        for (int i = 0; i < 8; ++i) { kv[i] = kp[i]; }
+    } else {
+#pragma unroll
+        for (int i = 0; i < 8; ++i) { kv[i] = make_uint4(0u, 0u, 0u, 0u); }
+    }
+    const int st = valid ? starts[b] : 0;
+    uint32_t vis_bits = 0;
+    for (int t = 0; t < nq; ++t) {
+        bool vis = valid && tail_sh[t] > st;
+        if (vis && seq_blk) {
+            if (use_mask) {
+                vis = (blk_mask & tok_mask[t]) != 0;
+            } else {
+                float m = 0.0f;
+                for (int sl = 0; sl < n_slots; ++sl) {
+                    m += seq_blk[(int64_t) b * n_slots + sl] * seq_tok[(int64_t) t * n_slots + sl];
+                }
+                vis = m > 0.5f;
+            }
+        }
+        if (vis) {
+            vis_bits |= 1u << t;
+        } else if (valid && w == 0) {
+            out[(int64_t) t * nb + b] = -INFINITY;
+        }
+    }
+    while (__any(vis_bits != 0)) {
+        const bool active = vis_bits != 0;
+        const int t = active ? __ffs(vis_bits) - 1 : 0;
+        vis_bits &= vis_bits - 1;
+        float acc = 0.0f;
+        // NOT unrolled: with the key in registers, an unrolled head loop expands 4 x 16 partials and the
+        // register file explodes (measured: 256 VGPRs / 159 spill). Runtime h keeps one head's a[16] live.
+        // The explicit unroll 1 also stops the compiler unrolling it on its own (trip count 4 is known).
+#pragma unroll 1
+        for (int h = 0; h < 4; ++h) {
+            const float mine  = idxd_wave_reg(kv, qsh + h * hs + t * IDXD3_TS + 66 * w);
+            const float other = __shfl_xor_sync(0xffffffff, mine, 1, 32);
+            const float w0 = w == 0 ? mine : other, w1 = w == 0 ? other : mine;
+            const float v = (w0 + zero) + (w1 + zero);
+            const float r = fmaxf(v, 0.0f);
+            acc = h == 0 ? r : acc + r;
+        }
+        if (active && w == 0) {
+            out[(int64_t) t * nb + b] = acc + zero;
+        }
+    }
+}
+
 static void idx_score_dec_launch(const int variant, const ggml_cuda_idx_score_dec_args & a, float * out, cudaStream_t stream) {
     const int nb = (int) a.rows->ne[0], nq = (int) (a.q->ne[1] / 4);
     const half *    kb   = (const half *) a.kb->data;
@@ -374,7 +659,18 @@ static void idx_score_dec_launch(const int variant, const ggml_cuda_idx_score_de
     const int32_t * rows = (const int32_t *) a.rows->data;
     const float *   q    = (const float *) a.q->data;
     const int64_t   qs   = (int64_t) (a.q->nb[1] / sizeof(float));
-    if (variant == 3) {
+    if (variant == 5) {
+        const size_t smem = (size_t) 4 * nq * IDXD3_TS * sizeof(float);
+        k_idx_score_dec5<<<(unsigned) ((2 * (int64_t) nb + 255) / 256), 256, smem, stream>>>(kb, kbs, rows, nb, q, qs, nq,
+            a.starts, a.tails, out, 0.0f, a.seq_blk, a.seq_tok, a.n_slots);
+    } else if (variant == 4) {
+        // dynamic qsh: 4 heads * nq queries * IDXD3_TS floats. At nq = 1 that is 2112 B against v3's 16896 B,
+        // so a CU hosts many more blocks. Max nq = IDXD_MAXQ = 8 -> 16896 B, under the 48 KB default, so no
+        // cudaFuncSetAttribute opt-in is needed.
+        const size_t smem = (size_t) 4 * nq * IDXD3_TS * sizeof(float);
+        k_idx_score_dec4<<<(unsigned) ((2 * (int64_t) nb + 255) / 256), 256, smem, stream>>>(kb, kbs, rows, nb, q, qs, nq,
+            a.starts, a.tails, out, 0.0f, a.seq_blk, a.seq_tok, a.n_slots);
+    } else if (variant == 3) {
         k_idx_score_dec3<<<(unsigned) ((2 * (int64_t) nb + 255) / 256), 256, 0, stream>>>(kb, kbs, rows, nb, q, qs, nq,
             a.starts, a.tails, out, 0.0f, a.seq_blk, a.seq_tok, a.n_slots);
     } else {
@@ -386,12 +682,19 @@ static void idx_score_dec_launch(const int variant, const ggml_cuda_idx_score_de
 void ggml_cuda_op_idx_score_dec(ggml_backend_cuda_context & ctx, const ggml_cuda_idx_score_dec_args & a) {
     const int nb = (int) a.rows->ne[0], nq = (int) (a.q->ne[1] / 4);
     GGML_ASSERT(nq >= 1 && nq <= IDXD_MAXQ && a.kb->nb[1] % 16 == 0 && ((uintptr_t) a.kb->data) % 16 == 0);
-    // STRIX_IDXD_V=1: k_idx_score_dec (every query's dot products run for the whole wave); 3 (default): k_idx_score_dec3
-    static const int variant = getenv("STRIX_IDXD_V") ? atoi(getenv("STRIX_IDXD_V")) : 3;
+    // STRIX_IDXD_V=1: k_idx_score_dec (every query's dot products run for the whole wave); 3: k_idx_score_dec3;
+    // 4: dynamic qsh (bit-identical, clean null on time); 5 (default): k_idx_score_dec5, register-staged key -
+    // scratch 132 -> 0 B/lane, event-timed 3-6x faster than v3 at the live shape, scores memcmp-identical and
+    // gate bit-identical (2026-10-15). The shipping-path slope win is small (~0.001 ms/1k) because the kernel
+    // is a smaller share of the depth slope than the GET_ROWS repeat implied - but the kernel itself is free now.
+    static const int variant = getenv("STRIX_IDXD_V") ? atoi(getenv("STRIX_IDXD_V")) : 5;
     // DEV: STRIX_IDXD_BENCH=n (graphs off) - at the first strips of 8192 blocks and more with n queries or more, both
-    // kernels 50 times each, timed with events, and their scores compared bit for bit
+    // kernels 50 times each, timed with events, and their scores compared bit for bit.
+    // STRIX_IDXD_BENCH_A / _B pick which variants are compared (default 1 vs 3; set 3 and 4 to check the new variant).
     static const int bench = getenv("STRIX_IDXD_BENCH") ? atoi(getenv("STRIX_IDXD_BENCH")) : 0;
     static const int bench_skip = getenv("STRIX_IDXD_BENCH_SKIP") ? atoi(getenv("STRIX_IDXD_BENCH_SKIP")) : 0;
+    static const int bench_a = getenv("STRIX_IDXD_BENCH_A") ? atoi(getenv("STRIX_IDXD_BENCH_A")) : 1;
+    static const int bench_b = getenv("STRIX_IDXD_BENCH_B") ? atoi(getenv("STRIX_IDXD_BENCH_B")) : 3;
     static int benched = 0, seen = 0;
     if (bench > 0 && nb >= 8192 && nq >= bench && seen++ >= bench_skip && benched < 4) {
         ++benched;
@@ -402,13 +705,13 @@ void ggml_cuda_op_idx_score_dec(ggml_backend_cuda_context & ctx, const ggml_cuda
         CUDA_CHECK(cudaEventCreateWithFlags(&e0, 0));
         CUDA_CHECK(cudaEventCreateWithFlags(&e1, 0));
         float ms[3] = {0.0f, 0.0f, 0.0f};
+        const int kern[2] = { bench_a, bench_b };
         for (int v = 1; v <= 2; ++v) {
             float * o = v == 1 ? o1.get() : o2.get();
-            const int kern = v == 1 ? 1 : 3;
-            idx_score_dec_launch(kern, a, o, ctx.stream());   // warm
+            idx_score_dec_launch(kern[v - 1], a, o, ctx.stream());   // warm
             CUDA_CHECK(cudaEventRecord(e0, ctx.stream()));
             for (int r = 0; r < 50; ++r) {
-                idx_score_dec_launch(kern, a, o, ctx.stream());
+                idx_score_dec_launch(kern[v - 1], a, o, ctx.stream());
             }
             CUDA_CHECK(cudaEventRecord(e1, ctx.stream()));
             CUDA_CHECK(cudaEventSynchronize(e1));
@@ -418,14 +721,14 @@ void ggml_cuda_op_idx_score_dec(ggml_backend_cuda_context & ctx, const ggml_cuda
         CUDA_CHECK(cudaMemcpy(h1.data(), o1.get(), n * sizeof(float), cudaMemcpyDeviceToHost));
         CUDA_CHECK(cudaMemcpy(h2.data(), o2.get(), n * sizeof(float), cudaMemcpyDeviceToHost));
         const bool same = memcmp(h1.data(), h2.data(), n * sizeof(float)) == 0;
-        fprintf(stderr, "IDXD_BENCH blocks=%d queries=%d slots=%d: v1 %.1f us, v3 %.1f us, v1 %.0f GB/s of keys, scores %s\n",
-                nb, nq, a.n_slots, 1000.0f * ms[1] / 50, 1000.0f * ms[2] / 50, (double) nb * 256 / (1e6 * ms[1] / 50),
-                same ? "identical" : "DIFFER");
+        fprintf(stderr, "IDXD_BENCH blocks=%d queries=%d slots=%d: v%d %.1f us, v%d %.1f us, v%d %.0f GB/s of keys, scores %s\n",
+                nb, nq, a.n_slots, bench_a, 1000.0f * ms[1] / 50, bench_b, 1000.0f * ms[2] / 50, bench_a,
+                (double) nb * 256 / (1e6 * ms[1] / 50), same ? "identical" : "DIFFER");
         CUDA_CHECK(cudaEventDestroy(e0));
         CUDA_CHECK(cudaEventDestroy(e1));
     }
     idx_score_dec_launch(variant, a, (float *) a.out->data, ctx.stream());
     CUDA_CHECK(cudaGetLastError());
     static unsigned hits = 0;
-    if (hits++ < 2) fprintf(stderr, "IDX_SCORE_DEC fused: blocks=%d queries=%d kernel v%d\n", nb, nq, variant);
+    if (hits++ < 40) fprintf(stderr, "IDX_SCORE_DEC fused: blocks=%d queries=%d kernel v%d\n", nb, nq, variant);
 }

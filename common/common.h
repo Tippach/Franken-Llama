@@ -293,6 +293,10 @@ struct common_params_sampling {
     std::string               reasoning_budget_message;        // message injected before end tag when budget exhausted
     bool                      reasoning_control = false;       // create the budget sampler on demand so reasoning can be ended at runtime
 
+    // strixllama: loop breaker - break token loops in thinking / answer (see common/loop-breaker.h)
+    bool                      loop_breaker = false;
+    float                     loop_breaker_nudge = 0.5f;       // effective temperature += this while nudging
+
     bool backend_sampling = false;
 
     // print the parameters into a string

@@ -76,6 +76,8 @@ add_library(${TARGET}
     debug.h
     download.cpp
     download.h
+    draft-length.cpp
+    draft-length.h
     fit.cpp
     fit.h
     hf-cache.cpp
@@ -89,6 +91,8 @@ add_library(${TARGET}
     llguidance.cpp
     log.cpp
     log.h
+    loop-breaker.cpp
+    loop-breaker.h
     ngram-cache.cpp
     ngram-cache.h
     ngram-map.cpp

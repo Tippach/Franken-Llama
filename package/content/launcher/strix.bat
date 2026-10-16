@@ -41,15 +41,17 @@ REM                 is actually being accepted (STRIX_SPEC_ADAPT, on by default)
 REM    YARN=1       rope scaling so CTX can exceed the trained 262144. Pair with
 REM                 CTX=524288 for ~512k context. Leave YARN=0 at or below 262144.
 REM    CTX=524288   context size in tokens; go above 262144 only together with YARN=1.
-REM  The defaults below are the validated single-user text config; uncomment to raise.
+REM    KVQ8=1       quantize the KV cache - and the MTP draft's - to q8_0: adds
+REM                 -ctk q8_0 -ctv q8_0 -ctkd q8_0 -ctvd q8_0. Default on; KVQ8=0 keeps
+REM                 the cache unquantized.
+REM  The defaults below are the validated shipping config: two 512k conversations with
+REM  YaRN and the KV cache at q8_0. A shell can still override any of them.
 REM ============================================================================
 if not defined VISION set "VISION=0"
-if not defined PARALLEL set "PARALLEL=1"
-if not defined YARN set "YARN=0"
-if not defined CTX set "CTX=262144"
-REM set "VISION=1"
-REM set "PARALLEL=2"
-REM set "YARN=1" & set "CTX=524288"
+if not defined PARALLEL set "PARALLEL=2"
+if not defined YARN set "YARN=1"
+if not defined CTX set "CTX=524288"
+if not defined KVQ8 set "KVQ8=1"
 
 REM ============================================================================
 REM  EDIT ME - the end-user knobs. An already-set environment value wins over
@@ -74,8 +76,7 @@ if not defined CTPL set "CTPL=%HERE%chat_template.jinja"
 
 REM --- context size ---------------------------------------------------------------
 REM The model is trained to 262144 tokens. CTX above that needs YaRN (see below) or
-REM quality degrades past the trained range.
-if not defined CTX set "CTX=262144"
+REM quality degrades past the trained range. Default set in QUICK ACCESS above.
 
 REM --- YaRN rope scaling (opt-in; default OFF) ------------------------------------
 REM YaRN lets the model address a context longer than it was trained on. YARN=1 adds
@@ -85,7 +86,7 @@ REM roughly 262144 x YARN_SCALE.
 REM   YARN=1 YARN_SCALE=2  with CTX=524288  -> 512k context. On a Ryzen AI Max+ 395 configured
 REM     with a 96 GB dedicated carve plus 16 GB shared, this loads and runs using about 97 GB.
 REM Leave YARN=0 for CTX up to 262144 (no rope scaling needed in the trained range).
-if not defined YARN set "YARN=0"
+REM Default set in QUICK ACCESS above (shipping config is YARN=1).
 if not defined YARN_SCALE set "YARN_SCALE=2"
 
 if not defined PORT set "PORT=9931"
@@ -121,8 +122,7 @@ if not defined CACHE set "CACHE=kvchain"
 
 REM --- concurrent conversations (slots) -------------------------------------------
 REM PARALLEL=1 runs one conversation at a time. PARALLEL>1 runs several at once and
-REM switches the cache to a single unified stream automatically.
-if not defined PARALLEL set "PARALLEL=1"
+REM switches the cache to a single unified stream automatically. Default set in QUICK ACCESS.
 if "%PARALLEL%"=="1" (
   set "KV_MODE=--no-kv-unified"
 ) else (
@@ -167,10 +167,11 @@ if defined MMPROJ set "MM_MODE=-mm "!MMPROJ!""
 
 REM prompt cache on disk: resolve auto now that VISION is final (MMPROJ= implies vision),
 REM then derive the flag set. Exactly ONE mechanism - the server refuses to run with both.
-REM --cache-ram 0 disables the prompt cache entirely, which is what the kv-chain path wants:
-REM the hash-chain store owns prompt state on disk there. The disk tier needs a RAM prompt
-REM cache to be a tier under - 1 GiB keeps short conversations resident and hands the rest
-REM to disk (rulith's own manager value); idle slots stay in their slots (--no-cache-idle-slots).
+REM The kv-chain path runs with the server's default RAM prompt cache (no --cache-ram 0):
+REM the hash-chain store owns prompt state on disk and does not need the RAM cache disabled.
+REM The disk tier needs a RAM prompt cache to be a tier under - 1 GiB keeps short
+REM conversations resident and hands the rest to disk (rulith's own manager value); idle
+REM slots stay in their slots (--no-cache-idle-slots).
 if /I "!CACHE!"=="auto" (
   if "!VISION!"=="1" (set "CACHE=kvchain") else (set "CACHE=disk")
 )
@@ -179,8 +180,7 @@ REM flip of VISION/CACHE must not leave the other mechanism's bytes behind - the
 REM below records who owns the dir and the whole dir is wiped when ownership changes.
 if not defined CACHE_DIR set "CACHE_DIR=%HERE%prompt-cache"
 if /I "!CACHE!"=="kvchain" (
-  set "PC_ARGS=--cache-ram 0"
-  set "PC_ARGS=!PC_ARGS! --kv-chain-dir "!CACHE_DIR!" --kv-chain-limit-gb %KVCHAIN_GB%"
+  set "PC_ARGS=--kv-chain-dir "!CACHE_DIR!" --kv-chain-limit-gb %KVCHAIN_GB%"
 )
 if /I "!CACHE!"=="disk" (
   set /A "PC_MIB = PCCACHE_GB * 1024"
@@ -289,6 +289,7 @@ echo  RUNTIME: %RUNTIME%
 echo ============================================================
 echo.
 
+if "!KVQ8!"=="1" echo  KVQ8  : K/V + draft K/V quantized to q8_0 ^(-ctk -ctv -ctkd -ctvd^)
 if "!LATIN!"=="1" if defined MTP echo  TRIM  : Latin draft vocab, trimmed at load ^(32768-token d2t^)
 if not "!LATIN!"=="1" if defined MTP echo  TRIM  : disabled, full draft vocab ^(LATIN=!LATIN!^)
 if defined MTP echo.
@@ -297,6 +298,10 @@ REM ============================================================================
 REM  Build the command line
 REM ============================================================================
 set "ARGS=!MODEL_FLAG! "!MODEL!" -ngl 99 --ctx-size %CTX% -b 8192 -ub 8192 --flash-attn on -t 4 --parallel %PARALLEL% --port %PORT% --host %HOSTIP% --temp 1.0 --presence-penalty 0.0 --repeat-penalty 1.0 %PC_ARGS% %KV_MODE% %MM_MODE% --fit off --load-mode none --lazy-mode on-direct"
+
+REM KV cache quantization: q8_0 for the target K/V and the MTP draft's K/V. Halves the KV
+REM footprint at depth for negligible quality loss; KVQ8=0 leaves the cache unquantized.
+if "!KVQ8!"=="1" set "ARGS=!ARGS! -ctk q8_0 -ctv q8_0 -ctkd q8_0 -ctvd q8_0"
 
 REM rope scaling only when asked for; appended so the default line is untouched
 if "!YARN!"=="1" set "ARGS=%ARGS% --rope-scaling yarn --rope-scale !YARN_SCALE! --yarn-orig-ctx 262144"

@@ -158,12 +158,21 @@ if ($bat -notmatch '(?m)^\s*if not defined CACHE set "CACHE=kvchain"') { Fail 'b
 if ($bat -notmatch '--kv-chain-dir') { Fail 'bat kvchain arm does not emit --kv-chain-dir' }
 if ($bat -notmatch '--cache-disk-dir') { Fail 'bat disk arm does not emit --cache-disk-dir' }
 if ($bat -notmatch 'owner\.txt') { Fail 'bat has no owner.txt stamp (shared-dir wipe-on-flip)' }
-# YaRN must be a real knob (default off, scale 2) and must actually emit the rope flags
-if ($bat -notmatch '(?m)^\s*if not defined YARN set "YARN=0"') { Fail 'bat has no YARN knob defaulting to 0' }
+# YaRN must be a real knob (shipping default ON at scale 2) and must actually emit the rope flags
+if ($bat -notmatch '(?m)^\s*if not defined YARN set "YARN=1"') { Fail 'bat has no YARN knob defaulting to 1' }
 if ($bat -notmatch '(?m)^\s*if not defined YARN_SCALE set "YARN_SCALE=2"') { Fail 'bat has no YARN_SCALE defaulting to 2' }
 if ($bat -notmatch '--rope-scaling yarn --rope-scale !YARN_SCALE! --yarn-orig-ctx 262144') { Fail 'bat never emits the YaRN rope flags' }
 # CTX must still be driven by the CTX var (a hardcoded -c would make the knob dead)
 if ($bat -notmatch '--ctx-size %CTX%') { Fail 'bat does not pass --ctx-size %CTX%' }
+# shipping default is two 512k slots (PARALLEL=2, CTX=524288) - the validated production shape
+if ($bat -notmatch '(?m)^\s*if not defined PARALLEL set "PARALLEL=2"') { Fail 'bat does not default PARALLEL=2' }
+if ($bat -notmatch '(?m)^\s*if not defined CTX set "CTX=524288"') { Fail 'bat does not default CTX=524288' }
+# KVQ8 knob: default ON, and it must actually emit the four q8_0 cache flags
+if ($bat -notmatch '(?m)^\s*if not defined KVQ8 set "KVQ8=1"') { Fail 'bat does not default KVQ8=1' }
+if ($bat -notmatch '-ctk q8_0 -ctv q8_0 -ctkd q8_0 -ctvd q8_0') { Fail 'bat KVQ8 arm does not emit the q8_0 cache flags' }
+# the kv-chain (shipping) arm runs with the server's default RAM cache: PC_ARGS is seeded by
+# --kv-chain-dir, not by --cache-ram 0 (only the CACHE=off arm may still disable the RAM cache)
+if ($bat -notmatch 'set "PC_ARGS=--kv-chain-dir') { Fail 'bat kvchain arm still seeds PC_ARGS with --cache-ram 0' }
 $activeIS = @(($bat -split "`n") | Where-Object { $_ -match '^\s*set\s+LLAMA_MTP_INDEX_SHARE' })
 if ($activeIS.Count) { Fail 'bat actively sets LLAMA_MTP_INDEX_SHARE' }
 Write-Host 'launcher guards: PASS'

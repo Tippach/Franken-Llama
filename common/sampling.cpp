@@ -3,7 +3,10 @@
 #include "common.h"
 #include "fit.h"
 #include "log.h"
+#include "loop-breaker.h"
 #include "reasoning-budget.h"
+
+#include <cstring>
 
 #include "ggml.h"
 
@@ -122,6 +125,11 @@ struct common_sampler {
 
     llama_token_data_array cur_p;
 
+    // strixllama: index of the loop-breaker sampler inside chain, or -1 when there is none. Kept as
+    // an index rather than a pointer because the chain owns its children and clone/copy rebuild them.
+    // NOTE: declared last because common_sampler is brace-initialized positionally above.
+    int lb_index = -1;
+
     void reset() {
         prev.clear();
 
@@ -216,6 +224,7 @@ struct common_sampler * common_sampler_init(
 
     llama_sampler * grmr = nullptr;
     llama_sampler * rbudget = nullptr;
+    int             lb_index = -1;   // strixllama: loop-breaker position inside the chain
     llama_sampler * chain = llama_sampler_chain_init(lparams);
 
     std::vector<llama_sampler *> samplers;
@@ -402,6 +411,46 @@ struct common_sampler * common_sampler_init(
                     GGML_ASSERT(false && "unknown sampler type");
             }
         }
+        // strixllama: loop breaker - sits last before the distribution sampler so it sees the same
+        // post-temperature logits the upstream nudge overrides ("temperature = temp + 0.5"), and so a
+        // forced close token cannot be pruned by top-k/top-p on the way past it.
+        if (params.loop_breaker) {
+            common_loop_breaker_config lb_cfg;
+            lb_cfg.nudge_tokens = 16;
+
+            // the answer cutoff works by forcing the end-of-generation token, so it has to be a token
+            // the caller actually treats as EOG. llama_vocab_is_eog covers both eos and eot, and for
+            // chat models the turn end is often the eot rather than the eos - forcing the wrong one
+            // stops nothing.
+            llama_token eog = llama_vocab_eos(vocab);
+            if (!llama_vocab_is_eog(vocab, eog)) {
+                const llama_token eot = llama_vocab_eot(vocab);
+                if (llama_vocab_is_eog(vocab, eot)) {
+                    eog = eot;
+                }
+            }
+
+            lb_index = (int) samplers.size();
+            samplers.push_back(common_loop_breaker_init(
+                params.reasoning_budget_start,
+                params.reasoning_budget_end.empty() ? std::vector<llama_token>{}
+                                                    : params.reasoning_budget_end.front(),
+                params.reasoning_budget_forced,
+                eog,
+                params.temp,
+                lb_cfg,
+                params.loop_breaker_nudge));
+
+            LOG_INF("%s: loop breaker enabled (think_start=%zu think_end=%zu forced_close=%zu eog=%d eog_is_eog=%d temp=%.3f)\n",
+                    __func__,
+                    params.reasoning_budget_start.size(),
+                    params.reasoning_budget_end.empty() ? (size_t) 0 : params.reasoning_budget_end.front().size(),
+                    params.reasoning_budget_forced.size(),
+                    (int) eog,
+                    (int) llama_vocab_is_eog(vocab, eog),
+                    params.temp);
+        }
+
         if (use_adaptive_p) {
             // only if user explicitly included adaptive-p sampler
             samplers.push_back(llama_sampler_init_adaptive_p(params.adaptive_target, params.adaptive_decay, params.seed));
@@ -435,6 +484,18 @@ struct common_sampler * common_sampler_init(
         params.backend_sampling = false;
     }
 
+    // strixllama: a loop breaker that has to influence the token cannot work when the token is chosen
+    // on the GPU and returned before the CPU chain runs. Same reason as the two above. Note this did
+    // NOT fire in the measured configuration (backend sampling is off by default) - it is defensive,
+    // so -bs cannot silently disable the breaker. The observed failure there was different: the chain
+    // was handed a one-candidate array, which is why the terminal actions are requests rather than
+    // logit masks (see common_loop_breaker_take_request).
+    if (params.loop_breaker && params.backend_sampling) {
+        LOG_INF("%s: backend sampling is not compatible with the loop breaker, disabling\n", __func__);
+
+        params.backend_sampling = false;
+    }
+
     auto * result = new common_sampler {
         /* .params  = */ params,
         /* .grmr    = */ grmr,
@@ -444,6 +505,8 @@ struct common_sampler * common_sampler_init(
         /* .cur     = */ {},
         /* .cur_p   = */ {},
     };
+
+    result->lb_index = lb_index;
 
     return result;
 }
@@ -473,6 +536,35 @@ static bool grammar_should_apply(struct common_sampler * gsmpl) {
         return state == REASONING_BUDGET_IDLE || state == REASONING_BUDGET_DONE;
     }
     return true;
+}
+
+// strixllama: is a grammar actually CONSTRAINING this step? Only a strict grammar is. A lazy grammar
+// is installed by any chat server that supports tools, and grammar_should_apply() returns true for it
+// on nearly every ordinary step (its state is IDLE/DONE most of the time), so treating "lazy grammar
+// present" as a constraint switches the loop breaker off in exactly the configuration it is meant to
+// protect - measured, not assumed: with a lazy grammar installed the breaker detected the loop and
+// logged the forced stop, and generation ran to the full limit anyway.
+// When a lazy grammar does engage, its own -inf masking is in front of the breaker and the "forced
+// token is not a candidate" guard inside the breaker backs down.
+static bool grammar_is_constraint(struct common_sampler * gsmpl) {
+    return gsmpl->grmr != nullptr && !gsmpl->params.grammar_lazy && grammar_should_apply(gsmpl);
+}
+
+// strixllama: stand the loop breaker down for one step. A strict grammar owns the token choice, and
+// structure a schema forces to repeat is not a model loop - the breaker would both misread the
+// repetition and, worse, force a token the grammar forbids. Upstream skips its breaker while a
+// constraint is active for the same reason.
+static void loop_breaker_exempt(struct common_sampler * gsmpl, bool exempt) {
+    if (gsmpl->lb_index < 0) {
+        return;
+    }
+
+    struct llama_sampler * lb = llama_sampler_chain_get(gsmpl->chain, gsmpl->lb_index);
+    if (lb == nullptr || std::strcmp(llama_sampler_name(lb), "loop-breaker") != 0) {
+        return;
+    }
+
+    common_loop_breaker_set_exempt(lb, exempt);
 }
 
 void common_sampler_accept(struct common_sampler * gsmpl, llama_token token, bool is_generated) {
@@ -518,7 +610,7 @@ void common_sampler_reset(struct common_sampler * gsmpl) {
 }
 
 struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
-    return new common_sampler {
+    auto * result = new common_sampler {
         /* .params  = */ gsmpl->params,
         /* .grmr    = */ llama_sampler_clone(gsmpl->grmr),
         /* .rbudget = */ llama_sampler_clone(gsmpl->rbudget),
@@ -527,6 +619,13 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .cur     = */ gsmpl->cur,
         /* .cur_p   = */ gsmpl->cur_p,
     };
+
+    // strixllama: the chain was rebuilt by clone but keeps the same children in the same order, so
+    // the loop breaker sits at the same index. without this the grammar exemption would silently
+    // stop working on every cloned sampler (the server clones per slot).
+    result->lb_index = gsmpl->lb_index;
+
+    return result;
 }
 
 void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
@@ -547,6 +646,7 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
     dst->cur_p      = src->cur_p;
     dst->cur_p.data = src->cur_p.data ? dst->cur.data() : nullptr; // re-point to dst's buffer
     dst->t_total_us = src->t_total_us;
+    dst->lb_index   = src->lb_index;   // strixllama: keep the loop-breaker grammar exemption working
 }
 
 void common_perf_print(const struct llama_context * ctx, const struct common_sampler * gsmpl) {
@@ -642,6 +742,9 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     // apply reasoning budget first
     llama_sampler_apply(rbudget, &cur_p);
 
+    const bool lb_grammar = grammar_is_constraint(gsmpl);
+    loop_breaker_exempt(gsmpl, lb_grammar);
+
     if (grammar_first && grammar_should_apply(gsmpl)) {
         llama_sampler_apply(grmr, &cur_p);
     }
@@ -697,6 +800,9 @@ llama_token common_sampler_sample_logits(struct common_sampler * gsmpl, const fl
     gsmpl->set_logits_row(logits, n_vocab);
 
     llama_sampler_apply(rbudget, &cur_p);
+
+    const bool lb_grammar = grammar_is_constraint(gsmpl);
+    loop_breaker_exempt(gsmpl, lb_grammar);
 
     if (grammar_first && grammar_should_apply(gsmpl)) {
         llama_sampler_apply(grmr, &cur_p);
@@ -820,6 +926,11 @@ static void spec_target_probs(struct common_sampler * gsmpl, struct llama_contex
     auto & cur_p = gsmpl->cur_p;
 
     llama_sampler_apply(gsmpl->rbudget, &cur_p);
+
+    // strixllama: the loop breaker lives inside the chain below, so it has to be stood down here too
+    // when a strict grammar owns the position - otherwise it would reshape the target distribution
+    // that the speculative verification is about to rejection-sample from.
+    loop_breaker_exempt(gsmpl, grammar_is_constraint(gsmpl));
 
     const int n = llama_sampler_chain_n(gsmpl->chain);
     for (int i = 0; i + 1 < n; ++i) {
@@ -1171,6 +1282,23 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_spec(
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl) {
     return llama_sampler_get_seed(gsmpl->chain);
+}
+
+// strixllama: take a pending loop-breaker request (0 none, 1 close the thinking span, 2 end the
+// generation). The sampler cannot act on these itself: it only chooses among the candidates it is
+// handed, and a grammar or a pre-filtered candidate list can leave end-of-turn / </think> out of that
+// set. The caller has the mechanisms that work - the reasoning-budget force, or its own stop flag.
+int common_sampler_loop_breaker_request(struct common_sampler * gsmpl) {
+    if (!gsmpl || gsmpl->lb_index < 0) {
+        return 0;
+    }
+
+    struct llama_sampler * lb = llama_sampler_chain_get(gsmpl->chain, gsmpl->lb_index);
+    if (lb == nullptr || std::strcmp(llama_sampler_name(lb), "loop-breaker") != 0) {
+        return 0;
+    }
+
+    return common_loop_breaker_take_request(lb);
 }
 
 bool common_sampler_reasoning_budget_force(struct common_sampler * gsmpl) {

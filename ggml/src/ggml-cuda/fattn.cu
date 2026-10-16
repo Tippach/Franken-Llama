@@ -8,6 +8,10 @@
 #include "getrows.cuh"
 
 #include <cstring>
+#include <cstdio>
+#include <mutex>
+#include <set>
+#include <string>
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 __launch_bounds__(256, 1)
@@ -523,7 +527,7 @@ static bool ggml_cuda_fattn_is_gather(const ggml_tensor * dst) {
     return ggml_get_op_params_i32(dst, 5) == GGML_FLASH_ATTN_EXT_GATHER && dst->src[8] != nullptr;
 }
 
-static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
+static best_fattn_kernel fattn_pick_kernel(const int device, const ggml_tensor * dst) {
 #ifndef FLASH_ATTN_AVAILABLE
     GGML_UNUSED(device); GGML_UNUSED(dst);
     return BEST_FATTN_KERNEL_NONE;
@@ -707,6 +711,47 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         }
     }
     return BEST_FATTN_KERNEL_TILE;
+}
+
+// strixllama: which FA kernel a given (head_dim, K type, V type, n_query, gqa) actually resolves
+// to, logged once per distinct combination. Added to diagnose why a q8_0 KV cache is SLOWER per
+// token of context than an f16 one at decode, against the bandwidth expectation. Measured 2026-10-14
+// on gfx1151, head_dim 256, gqa 12, dense decode, from the slope of ms/token vs context depth:
+//   f16  -> TILE : 24.576 MB per 1k of context in 0.1231 ms = 199.6 GB/s (DRAM roof 195.4)
+//   q8_0 -> VEC  : 12.288 MB per 1k of context in 0.2291 ms =  53.6 GB/s (27% of roof)
+// q8 halves the bytes and is still 1.86x slower, because the kernel it is routed to moves them a
+// third as fast. Routing q8 to TILE instead was tried and measured WORSE (depth slope 0.4111 vs
+// 0.3431 ms/1k, +19.8%): the f16 scratch TILE materialises is not a roof-bandwidth copy, so VEC
+// remains the better of the two. The fix is a faster q8 VEC dequant at D=256, not a selector change.
+// STRIX_FA_KERNEL_LOG=1 turns the logging on; silent otherwise.
+static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
+    const best_fattn_kernel k = fattn_pick_kernel(device, dst);
+
+    static const bool log_on = getenv("STRIX_FA_KERNEL_LOG") && atoi(getenv("STRIX_FA_KERNEL_LOG")) != 0;
+    if (log_on && !ggml_cuda_fattn_is_gather(dst)) {
+        static std::mutex              mtx;
+        static std::set<std::string>   seen;
+        const ggml_tensor * Q = dst->src[0];
+        const ggml_tensor * K = dst->src[1];
+        const ggml_tensor * V = dst->src[2];
+        const int           gqa = K->ne[2] ? (int) (Q->ne[2] / K->ne[2]) : 1;
+        char key[64];
+        snprintf(key, sizeof(key), "%d|%d|%d|%d|%d",
+                 (int) K->ne[0], (int) K->type, (int) V->type, (int) Q->ne[1], gqa);
+        std::lock_guard<std::mutex> lock(mtx);
+        if (seen.insert(std::string(key)).second) {
+            const char * name = k == BEST_FATTN_KERNEL_VEC       ? "VEC"
+                                : k == BEST_FATTN_KERNEL_MMA_F16 ? "MMA_F16"
+                                : k == BEST_FATTN_KERNEL_TILE    ? "TILE"
+                                                                 : "NONE";
+            const bool f16_expanded = k == BEST_FATTN_KERNEL_TILE || k == BEST_FATTN_KERNEL_MMA_F16;
+            fprintf(stderr, "%s: FA kernel=%s head_dim=%d K=%s V=%s n_q=%d gqa=%d%s\n",
+                    __func__, name, (int) K->ne[0], ggml_type_name(K->type), ggml_type_name(V->type),
+                    (int) Q->ne[1], gqa,
+                    f16_expanded ? " [K/V DEQUANTIZED TO F16 EVERY CALL]" : "");
+        }
+    }
+    return k;
 }
 
 size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * dst) {

@@ -196,6 +196,10 @@ int ggml_cuda_match_qsa_select(const ggml_cgraph * g, int i, ggml_cuda_qsa_selec
     if (rep->op != GGML_OP_REPEAT) return 0;
     const bool dbg = getenv("LLAMA_QSA_SELECT_DEBUG") != nullptr;
     static unsigned nrej = 0;
+    // Only report a reject when a TOP_K actually closes the chain within the window - i.e. this REPEAT
+    // is a GENUINE select candidate that then failed a later guard. Every other REPEAT in the graph
+    // (RMS_NORM, the MoE, the HC mix) also reaches this matcher and returns at "no topk in window";
+    // printing those filled the 40-line cap before the decode indexer's real reject reason ever showed.
     auto reject = [&](const char * why) {
         if (dbg && nrej++ < 40) {
             fprintf(stderr, "QSA_SELECT_REJECT i=%d at=%s window:", i, why);
@@ -205,13 +209,13 @@ int ggml_cuda_match_qsa_select(const ggml_cgraph * g, int i, ggml_cuda_qsa_selec
         return 0;
     };
     const ggml_tensor * tails = rep->src[0];
-    if (!tails) return reject("no tails");
+    if (!tails) return 0;
     // forward-scan for the TOP_K that closes the chain (within a small window)
     int j = -1;
     for (int k = i + 1; k <= i + 10 && k < g->n_nodes; ++k) {
         if (g->nodes[k]->op == GGML_OP_TOP_K) { j = k; break; }
     }
-    if (j < 0) return reject("no topk in window");
+    if (j < 0) return 0;   // not a select candidate at all: silent, do not consume the reject budget
     const ggml_tensor * topk = g->nodes[j];
     const ggml_tensor * add  = topk->src[0];
     if (!add || add->op != GGML_OP_ADD) return reject("topk src not ADD");

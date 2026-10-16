@@ -16,6 +16,7 @@
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
+#include "draft-length.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
 #define XXH_INLINE_ALL
@@ -110,6 +111,11 @@ static void strixllama_fault(const char * site) {
         throw std::bad_alloc();
     }
 }
+
+// strixllama: ceiling on the per-slot answer-start recurrent snapshot kept for kv-chain live resume
+// (see server_slot::kv_chain_ans_state). Measured ~113 MiB on this model; the cap only exists so a
+// model with a much bigger recurrent state cannot pin an unbounded buffer per slot.
+#define KVCHAIN_ANS_STATE_MAX ((size_t) 512 * 1024 * 1024)
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
@@ -388,6 +394,36 @@ static std::atomic<int> g_strix_draft_cap{ [] {
     return e && *e ? std::max(0, atoi(e)) : INT_MAX;
 }() };
 
+// strixllama: the draft-length controller's settings, read once. STRIXLLAMA_DRAFT_LEN=0 turns the
+// whole thing off and the server drafts the fixed --spec-draft-n-max exactly as before. The cost
+// table is measured on this hardware (harness/_draft_cost.ps1) and is in the header; only the knobs
+// a tuning experiment needs are exposed here.
+//
+// The prefix is STRIXLLAMA_, not STRIX_, on purpose: strixllama_bake_env() drops every inherited
+// LLAMA_*/GGML_*/STRIX_* variable that is not in the baked table, so a STRIX_-named switch would be
+// silently wiped before it was read - the control arm of an A/B would quietly run the treatment and
+// the experiment would report "no effect". Same trap as the loop breaker's fault hook.
+static common_draft_length_config draft_length_config_from_env() {
+    common_draft_length_config cfg;
+    auto num = [](const char * name, float def) {
+        const char * e = getenv(name);
+        return e && *e ? (float) atof(e) : def;
+    };
+    cfg.max_width          = (int) num("STRIXLLAMA_DRAFT_MAX",     3.0f);
+    cfg.default_width      = (int) num("STRIXLLAMA_DRAFT_DEFAULT", 3.0f);
+    cfg.block              = (int) num("STRIXLLAMA_DRAFT_BLOCK",   cfg.block);
+    cfg.margin             =      num("STRIXLLAMA_DRAFT_MARGIN",   cfg.margin);
+    cfg.probe_every_blocks = (int) num("STRIXLLAMA_DRAFT_PROBE",   cfg.probe_every_blocks);
+    cfg.allow_zero         =      num("STRIXLLAMA_DRAFT_ZERO",     cfg.allow_zero ? 1.0f : 0.0f) != 0.0f;
+    cfg.ctx_slope          =      num("STRIXLLAMA_DRAFT_CTX_SLOPE",cfg.ctx_slope);
+    return cfg;
+}
+
+static bool draft_length_on() {
+    static const bool on = !getenv("STRIXLLAMA_DRAFT_LEN") || atoi(getenv("STRIXLLAMA_DRAFT_LEN")) != 0;
+    return on;
+}
+
 struct server_slot {
     int id;
 
@@ -514,6 +550,59 @@ struct server_slot {
 
     // true once a replay run has established the slot's KV state; later runs only APPEND.
     bool kv_chain_replay_started = false;
+
+    // strixllama: the RECURRENT state as it stood at the end of the last prompt -- the point the answer
+    // started from, which is exactly where the next request of a continuing conversation forks back to.    // kv-chain has no other rung there: the disk chain's walk stops at the conversation's first image (a
+    // cached chunk after an image is named with that image folded into the running fingerprint, which the
+    // walk cannot produce), so the rung sits far behind the fork and everything between gets re-prefilled
+    // -- every later image re-encoded, every turn. This is the piece RAM can supply and disk cannot.
+    // It lives on the SLOT, not in prompt.checkpoints, for two reasons: launch_slot_with_task drops the
+    // stale prompt buffer (which clears checkpoints), and the launcher runs --cache-ram 0 so there is no
+    // prompt_cache to page a real checkpoint into or back out of.
+    // Restoring it is a state OVERWRITE, not a rewind, so the recurrent memory's n_rs_seq rollback bound
+    // (3 here) does not apply -- that bound is what makes an unaligned rewind GGML_ABORT.
+    std::vector<uint8_t> kv_chain_ans_state;
+    int64_t              kv_chain_ans_cells = -1; // prompt cells the snapshot covers
+    llama_pos            kv_chain_ans_pos   = -1; // KV position the head sat at, for the consistency check
+
+    // this prompt's KV came from the snapshot above rather than from the disk chain.
+    bool kv_chain_live_resume = false;
+
+    // ...and the store's fingerprint was handed back to the value it held at this fork in the PREVIOUS
+    // prompt, so the resumed turn keeps extending the chain: its chunks get the same names a cold run of
+    // the same prompt would give them, which is what makes a later restart restore deep instead of stopping
+    // at the conversation's first image again.
+    //
+    // WHICH fingerprint, and where to restart the cursor. The two block schedules agree up to the block
+    // containing the fork, and the fork is the previous prompt's last cell, so that block is the previous
+    // prompt's LAST block -- which is always glue, since a cached block has to end before the last cell.
+    // Two shapes, and both are available synchronously:
+    //  - TEXT (a short tail, or a full-width block that ends exactly on the last cell and so was never
+    //    cached): the new prompt's block starting there is wider -- a different chunk, never saved -- so it
+    //    must be named with the fingerprint that block was ENTERED with, and the cursor restarts ON it. The
+    //    index carries over because the schedules are identical up to that point.
+    //  - an IMAGE: the new prompt's block there is the same image (it is inside the shared prefix), so it
+    //    is already saved/folded and the next block needs the fingerprint AFTER the fold; the cursor
+    //    restarts after it. fold_glue is synchronous, so that value is current -- no pipeline ordering to
+    //    guess at. (For a saved chunk the two values coincide anyway: save() publishes the previous chunk
+    //    before naming this one.)
+    uint64_t kv_chain_ans_fp    = 0;  // the fingerprint to hand back
+    size_t   kv_chain_ans_blk   = 0;  // where to restart the save-hook cursor
+    bool     kv_chain_ans_fp_ok = false;
+
+    // the same, for the prompt being prefilled RIGHT NOW. The hooks write these as they handle each block
+    // and DONE_PROMPT resolves them into the ans_ fields above; kept apart so a prompt that never reaches a
+    // hook cannot leave a stale answer fingerprint behind.
+    uint64_t kv_chain_cur_fp_in  = 0;  // fingerprint the last handled block was entered with
+    uint64_t kv_chain_cur_fp_out = 0;  // the store's fingerprint right after handling it
+    size_t   kv_chain_cur_fp_blk = 0;  // that block's index
+    bool     kv_chain_cur_fp_img = false; // ...and whether it was an image
+    bool     kv_chain_cur_fp_ok  = false;
+
+    // no fingerprint to hand back (the hook had not caught up, or the state dump failed), so nothing this
+    // prompt computes can be named the way a cold run would name it: the save hook parks instead of
+    // publishing chunks no correct run will ever ask for.
+    bool     kv_chain_save_parked = false;
 
     server_prompt prompt;
 
@@ -869,6 +958,11 @@ struct server_slot {
 
         prompt.clear();
 
+        // the rows this snapshot would resume onto are gone with the sequence, so the rung is worthless
+        kv_chain_ans_state.clear();
+        kv_chain_ans_cells = -1;
+        kv_chain_ans_pos   = -1;
+
         n_tokens_persist_checked = -1;
         if (disk_cache) {
             disk_cache->ckpt_release(ckpt_paged);
@@ -911,22 +1005,14 @@ struct server_slot {
     // not in server_slot_stats to avoid copying to every task result
     std::vector<uint64_t> n_accepted_per_pos;
 
-    // strixllama (issue #18): a sampled draft on one generating conversation is the table's length (2) or one more,
-    // whichever gives more tokens a second here. Each pass of either length shows whether its first two positions
-    // were accepted (acc1, acc2, running means); a pass of the longer one also shows the third given the first two
-    // (acc3) and costs its own time (ms[1] against ms[0]). Tokens a pass: 1 + acc1 + acc2, plus acc2 * acc3 for the
-    // longer one. Kept across the slot's requests: a conversation's next request is the same kind of text
-    // The length holds for a block of passes: each switch rebuilds the verify graph (another shape), and passes
-    // alternating between lengths measured the longer one ~30 ms dearer than it is. The first passes of a block are
-    // not timed.
-    struct spec_len_stats {
-        double acc1 = 0, acc2 = 0, acc3 = 0, ms[2] = { 0, 0 };
-        int    n_acc = 0, n_acc3 = 0, n_ms[2] = { 0, 0 };
-        int    block = 0, block_arm = 0, block_left = 0, block_untimed = 0;
-    } spec_len;
-    int     spec_len_arm = -1; // this pass: 0 the table's length, 1 one more, -1 not chosen here
-    int64_t spec_len_t   = 0;  // when this slot's previous pass ended (0: none to time from)
-    int     spec_len_used[2] = { 0, 0 };
+    // strixllama: the draft length this slot's passes should use, chosen from what this slot's own
+    // drafts have been accepting (common/draft-length.h). Per slot on purpose: acceptance is a
+    // property of the text being generated, so a conversation that turns from code to prose
+    // converges to prose's answer without dragging code's history along (issue #18 hit this).
+    // n_draft_chosen is the width asked for this pass, -1 when this slot did not draft.
+    common_draft_length_controller draft_len { draft_length_config_from_env() };
+    int  n_draft_chosen = -1;
+    bool draft_len_on   = false;
 
     std::function<void(int /* id_slot */)>   callback_on_release;
     std::function<void(const server_slot &)> callback_on_reset; // called before reset()
@@ -945,6 +1031,10 @@ struct server_slot {
         kv_chain_restore_cells = 0;
         kv_chain_restore_chunk = 0;
         kv_chain_replay_started = false;
+        kv_chain_live_resume    = false;
+        // NOTE: kv_chain_ans_state deliberately SURVIVES reset() -- it is taken at DONE_PROMPT, released
+        // with the answer, and consumed by the NEXT task's restore. clearing it here would delete the rung
+        // between the two turns. prompt_clear() is what drops it, when the slot's rows really go.
         // the block schedule + hash chain belong to the CURRENT task; they are rebuilt at
         // the next prompt start (see the STARTED block). if they are not cleared here, the
         // PREVIOUS task's chain leaks into the next task's classification: the classifier
@@ -980,16 +1070,10 @@ struct server_slot {
         // note: callback_on_reset() must have run before this, see release()
         stats = {};
         n_accepted_per_pos.clear();
-        spec_len_arm = -1;
-        spec_len_t   = 0;
-        spec_len_used[0] = spec_len_used[1] = 0;
-        // the previous request's statistics stay as a start, at the weight of a few passes: a chat that turns from code
-        // to prose kept code's acceptance of the third position for hundreds of passes
-        spec_len.n_acc     = std::min(spec_len.n_acc, 16);
-        spec_len.n_acc3    = std::min(spec_len.n_acc3, 16);
-        spec_len.n_ms[0]   = std::min(spec_len.n_ms[0], 8);
-        spec_len.n_ms[1]   = std::min(spec_len.n_ms[1], 8);
-        spec_len.block_left = 0;
+        n_draft_chosen = -1;
+        // the previous request's acceptance stays as a start, at a capped weight: a chat that turns
+        // from code to prose kept code's acceptance of the third position for hundreds of passes
+        draft_len.boundary();
 
         n_predict_max = -1;
 
@@ -1288,9 +1372,22 @@ struct server_slot {
                     draft_ratio, n_draft_accepted, n_draft_total, mean_acc_len);
             SLT_TRC(*this,
                     "     acc per pos = (%s)\n", acceptance_rates_per_pos.c_str());
-            if (spec_len_used[0] + spec_len_used[1] > 0) {
-                SLT_INF(*this, "draft length: %d passes at the table's, %d at one more (acc %.2f %.2f %.2f, %.1f / %.1f ms a pass)\n",
-                        spec_len_used[0], spec_len_used[1], spec_len.acc1, spec_len.acc2, spec_len.acc3, spec_len.ms[0], spec_len.ms[1]);
+            if (draft_len_on && draft_len.counters().detections > 0) {
+                // what the controller decided and why: the passes spent at each width, and the
+                // acceptance estimates the objective was built from. Without the estimates in the
+                // log a wrong decision is indistinguishable from a controller that never ran.
+                const auto cn = draft_len.counters();
+                std::string used;
+                for (int w = 0; w <= draft_len.config().max_width; ++w) {
+                    used += string_format("%s%d", w ? "," : "", (int) cn.used[w]);
+                }
+                std::string acc;
+                for (int i = 0; i < draft_len.config().max_width; ++i) {
+                    acc += string_format("%s%.3f/%d", i ? "," : "", (double) draft_len.acceptance(i),
+                                         draft_len.samples(i));
+                }
+                SLT_INF(*this, "draft length: passes by width %s (P accept %s), %d blocks, %d probe, %d at none\n",
+                        used.c_str(), acc.c_str(), (int) cn.blocks, (int) cn.probes, (int) cn.zero_blocks);
             }
         }
 
@@ -1716,6 +1813,13 @@ private:
         if (!kv_chain || kv_chain_prefill_slot != &slot) {
             return;
         }
+        // strixllama: this prompt resumed from the slot's own answer-start state and the store could not be
+        // handed back the fork's fingerprint, so anything it computed now would be named under the root --
+        // chunks no correct run will ever ask for, i.e. dead bytes in the quota. Park. When the fp WAS
+        // restored the hook runs normally and the resumed turn keeps extending the chain.
+        if (slot.kv_chain_save_parked) {
+            return;
+        }
         const int pos_max = (int) llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
         if (pos_max < 0) {
             return;
@@ -1766,6 +1870,15 @@ private:
                 // cached block after it is only trusted when this glue reproduced byte-identically.
                 kv_chain->fold_glue(slot.ctx_tgt, slot.id, blk.pos_lo, blk.pos_hi);
             }
+            // strixllama: remember this block's fingerprints for the next prompt's live resume. in is the
+            // value the block was entered with, out the store's fingerprint now that it has been handled;
+            // for a saved chunk the two coincide (save() publishes the previous chunk before naming this
+            // one), for folded glue they do not. See the slot fields for which one a resume needs.
+            slot.kv_chain_cur_fp_in  = kv_chain->entry_fp_used();
+            slot.kv_chain_cur_fp_out = kv_chain->running_fp();
+            slot.kv_chain_cur_fp_blk = slot.kv_chain_next_block;
+            slot.kv_chain_cur_fp_img = blk.is_image;
+            slot.kv_chain_cur_fp_ok  = true;
             SLT_DBG(slot, "kv-chain[ubatch]: block %zu %s pos=[%d,%d) cells=[%lld,%lld) committed (pos=%d cb_n_pos_last=%d)\n",
                     slot.kv_chain_next_block, blk.cached ? "CACHED" : "glue",
                     (int) blk.pos_lo, (int) blk.pos_hi, (long long) blk.cell_lo, (long long) blk.cell_hi,
@@ -2737,7 +2850,11 @@ private:
                 /* reasoning_budget      */ params_base.sampling.reasoning_budget_tokens,
                 /* reasoning_budget_msg  */ params_base.sampling.reasoning_budget_message,
                 /* media_path            */ params_base.media_path,
-                /* force_pure_content    */ params_base.force_pure_content_parser
+                /* force_pure_content    */ params_base.force_pure_content_parser,
+                // strixllama: the OAI chat path has no params_base of its own, so the server default
+                // for the loop breaker reaches requests only through chat_params (see
+                // oaicompat_chat_params_parse)
+                /* loop_breaker          */ params_base.sampling.loop_breaker
             };
 
             {
@@ -3629,72 +3746,26 @@ private:
                 n_img ? (", " + std::to_string(n_img) + " image(s) with them").c_str() : "", n_before, task.tokens.size());
     }
 
-    // strixllama (issue #18): STRIX_SPEC_LEN_ADAPT=0 keeps the sampled table's length (2.4.1 - 0.5.5)
-    static bool spec_len_on() {
-        static const bool on = !getenv("STRIX_SPEC_LEN_ADAPT") || atoi(getenv("STRIX_SPEC_LEN_ADAPT")) != 0;
-        return on;
+    // strixllama: the draft width for this pass. The controller holds its choice for a block of
+    // passes because every switch is another verify shape to build - passes alternating between
+    // widths measured the wider one ~30 ms dearer than it is (issue #18) - and it needs the context
+    // length because the extra draft cells are not free once attention covers a long prompt.
+    static int draft_len_choose(server_slot & slot) {
+        return slot.draft_len.take(slot.prompt.n_tokens());
     }
 
-    // the table's length (0) or one more (1), for a block of SPEC_LEN_BLOCK passes: the one with more tokens a second.
-    // Tokens a pass: 1 + acc1 + acc2 for the shorter, plus acc2 * acc2 / acc1 for the longer - the third position
-    // accepted as often after the second as the second after the first, which came within 0.05 of the measurement on
-    // code, an agent and prose (10-10). The longer pass's time over the shorter's: 1.14 at short contexts (12-14%
-    // measured on all three), rising with the context to 1.30 at 85K (one more position 18.5 ms there,
-    // docs/decode-budget.md). Times measured while it runs went stale - a length not chosen is not timed again - and
-    // kept code at the short draft, so they only go to the log. Nothing is spent finding out: acc1 and acc2 show in
-    // every pass
-    static constexpr int    SPEC_LEN_BLOCK   = 32;
-    static constexpr int    SPEC_LEN_UNTIMED = 2;
-    static int choose_spec_len(server_slot & slot) {
-        auto & st = slot.spec_len;
-        if (st.block_left <= 0) {
-            ++st.block;
-            int arm = 0;
-            if (st.n_acc >= 16 && st.acc1 > 0.0) {
-                const double ctx   = (double) slot.prompt.n_tokens();
-                const double ratio = 1.14 + 0.16 * std::min(ctx / 85000.0, 1.5);
-                const double tok0  = 1.0 + st.acc1 + st.acc2;
-                const double tok1  = tok0 + st.acc2 * std::min(1.0, st.acc2 / st.acc1);
-                // the longer draft only when it is clearly ahead: near the line the estimate's error decides
-                arm = tok1 / ratio > 1.02 * tok0 ? 1 : 0;
-            }
-            st.block_untimed = arm != st.block_arm ? SPEC_LEN_UNTIMED : 0;
-            st.block_arm  = arm;
-            st.block_left = SPEC_LEN_BLOCK;
-        }
-        st.block_left--;
-        return st.block_arm;
-    }
-
-    // a pass's outcome: the acceptance of its positions and the time since the slot's previous pass
-    static void note_spec_len(server_slot & slot, size_t n_accepted) {
-        auto & st = slot.spec_len;
-        const int arm = slot.spec_len_arm;
-        const int64_t t = ggml_time_us();
-        if (arm < 0) {
-            slot.spec_len_t = 0;
+    // a pass's outcome: which of its draft positions were accepted. Only the width actually asked
+    // for is an observation; a pass that drafted nothing says nothing about any position.
+    static void note_draft_len(server_slot & slot, size_t n_accepted, size_t n_drafted) {
+        if (slot.n_draft_chosen < 0) {
             return;
         }
-        const auto mean = [](double & m, double x, int & n, int window) {
-            n++;
-            m += (x - m) / std::min(n, window);
-        };
-        mean(st.acc1, n_accepted >= 1 ? 1.0 : 0.0, st.n_acc, 128);
-        st.n_acc--; // counted once for the pass, below
-        mean(st.acc2, n_accepted >= 2 ? 1.0 : 0.0, st.n_acc, 128);
-        if (arm == 1 && n_accepted >= 2) {
-            mean(st.acc3, n_accepted >= 3 ? 1.0 : 0.0, st.n_acc3, 64);
-        }
-        if (st.block_untimed > 0) {
-            st.block_untimed--;           // the passes right after a switch pay for the other shape's graph
-        } else if (slot.spec_len_t > 0) {
-            const double ms = (t - slot.spec_len_t) / 1e3;
-            if (ms < 1000.0) {
-                mean(st.ms[arm], ms, st.n_ms[arm], 64);
-            }
-        }
-        slot.spec_len_t = t;
+        slot.draft_len.observe(n_accepted, n_drafted);
     }
+
+    // the width the drafter asks for is capped by the caller at --spec-draft-n-max, so a controller
+    // that wants to draft nothing has to be honoured by not drafting at all: n_draft_max == 0 below
+    // takes the slot out of the drafting set for this pass.
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
         // process per-request lora adapters
@@ -3813,6 +3884,13 @@ private:
 
                 slot.spec_sampling = on && spec && common_speculative_get_synth_probs(spec.get()).empty() &&
                     common_sampler_spec_supported(slot.smpl.get());
+                // strixllama: the draft-length controller applies to greedy and sampled drafting
+                // alike - a draft that does not pay for itself costs the same either way. It needs a
+                // drafter to observe, and it stays off when the drafter is a synthetic-probs one
+                // (those are not this server's MTP passes to size).
+                slot.draft_len_on = draft_length_on() && spec &&
+                    common_speculative_get_synth_probs(spec.get()).empty();
+                SLT_DBG(slot, "draft length control %s\n", slot.draft_len_on ? "on" : "off");
                 SLT_DBG(slot, "speculative sampling %s (chain: %s)\n", slot.spec_sampling ? "on" : "off",
                         common_sampler_print(slot.smpl.get()).c_str());
                 if (slot.spec_sampling) {
@@ -4002,6 +4080,35 @@ private:
             slot.has_next_token = false;
 
             SLT_DBG(slot, "%s", "stopped by EOS\n");
+        }
+
+        // strixllama: the loop breaker detected a loop it cannot break by itself. It is a sampler, so
+        // it can only pick among the candidates it is handed, and end-of-turn / </think> are often not
+        // among them - the server pre-filters the candidate set. So the breaker raises a request and
+        // the server carries it out with the mechanism that can: the reasoning-budget force (already
+        // used by the reasoning_end control action) to close a thinking span, or its own stop flag to
+        // end the generation.
+        if (slot.smpl) {
+            const int lb_req = common_sampler_loop_breaker_request(slot.smpl.get());
+
+            if (lb_req == 2) {
+                if (slot.has_next_token) {
+                    slot.stop           = STOP_TYPE_EOS;
+                    slot.has_next_token = false;
+                    SLT_INF(slot, "%s", "stopped by loop breaker\n");
+                }
+            } else if (lb_req == 1) {
+                if (common_sampler_reasoning_budget_force(slot.smpl.get())) {
+                    SLT_INF(slot, "%s", "thinking block closed by loop breaker\n");
+                } else {
+                    // no reasoning-budget sampler to drive (nothing was armed for this request), so
+                    // there is no way to emit the end-of-thinking sequence - end the generation, which
+                    // is the same failure mode the breaker exists to prevent.
+                    slot.stop           = STOP_TYPE_EOS;
+                    slot.has_next_token = false;
+                    SLT_INF(slot, "%s", "stopped by loop breaker (no reasoning budget available to close)\n");
+                }
+            }
         }
 
         SLT_DBG(slot, "n_gen = %d, n_remaining = %d, next token: %5d '%s'\n", (int) slot.stats.n_gen, slot.n_remaining(), result.tok, token_str.c_str());
@@ -5673,12 +5780,18 @@ private:
                 const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
                 int cap = slot.spec_sampling ? n_draft_cap_sampled : n_draft_cap;
-                slot.spec_len_arm = -1;
-                if (slot.spec_sampling && n_gen == 1 && cap >= 2 && cap < n_draft_limit && cap < slot.get_n_draft_max() &&
-                        spec_len_on()) {
-                    slot.spec_len_arm = choose_spec_len(slot);
-                    cap += slot.spec_len_arm;
-                    slot.spec_len_used[slot.spec_len_arm]++;
+                slot.n_draft_chosen = -1;
+                // strixllama: one conversation generating -> the per-slot controller picks the
+                // width from this conversation's own acceptance. It replaces issue #18's chooser,
+                // which could only ever propose the configured length or one more and was gated off
+                // at the shipping config anyway (cap < n_draft_limit is false when nothing else
+                // binds cap). Several conversations generating -> spec_adapt's step-level table, as
+                // before: there a verify cell's cost is shared and the per-slot estimate does not
+                // apply.
+                if (slot.draft_len_on && n_gen == 1) {
+                    const int w = draft_len_choose(slot);
+                    slot.n_draft_chosen = std::min(w, n_draft_limit);
+                    cap = slot.n_draft_chosen;
                 }
                 const int n_draft_max = std::min(slot.get_n_draft_max(), cap);
 
@@ -5965,6 +6078,14 @@ private:
                             slot.kv_chain_identity.clear();
                             slot.kv_chain_next_block = 0;
                             slot.kv_chain_restore_cells = 0;
+                            // strixllama: fresh fingerprint capture for THIS prompt. Without the reset a
+                            // prompt whose hooks never ran would inherit the previous prompt's answer.
+                            slot.kv_chain_cur_fp_ok  = false;
+                            slot.kv_chain_cur_fp_img = false;
+                            slot.kv_chain_cur_fp_in  = 0;
+                            slot.kv_chain_cur_fp_out = 0;
+                            slot.kv_chain_cur_fp_blk = 0;
+                            slot.kv_chain_save_parked = false;
                             const int64_t total_cells = (int64_t) input_tokens.size();
                             uint64_t prev = kv_chain->root_hash();
                             for (auto & b : input_tokens.kv_block_schedule(ubs_i)) {
@@ -6366,6 +6487,93 @@ private:
                                     n_past, slot.prompt.n_tokens(), (int) slot.task->params.cache_prompt,
                                     (int) input_tokens.has_mtmd, input_tokens.size());
                         }
+                        // strixllama: LIVE RESUME. This request continues the previous one from exactly where
+                        // its answer started, and this slot still holds those rows -- so resume from the fork
+                        // and read nothing from disk. This is what stops an image conversation from re-encoding
+                        // every image on every turn: the disk walk cannot pass the conversation's first image
+                        // (a cached chunk after an image is named with that image folded into the running
+                        // fingerprint, and the fold cannot be reproduced after the fact -- measured: the same
+                        // window hashes differently when dumped later, because a window whose upper edge is
+                        // the sequence's max position also absorbs the recurrent blob). So the disk rung sits
+                        // at the first image and the fill loop prefills forward through every later one.
+                        // The snapshot below supplies the one thing RAM cannot: the recurrent head as it stood
+                        // at the fork. Writing it is a state OVERWRITE, so the n_rs_seq rollback bound that
+                        // makes an unaligned rewind abort does not apply.
+                        // The save hook is parked for the whole prompt: running_fp_ was reset by begin_prompt()
+                        // and cannot be re-derived over the skipped prefix, so anything saved now would be
+                        // named with a fingerprint no correct run ever asks for -- junk in the quota. The chain
+                        // keeps what the cold runs wrote; a fresh process still restores the normal way.
+                        bool live_resumed = false;
+                        {
+                            static const bool live_on =
+                                !getenv("STRIX_KVCHAIN_LIVE") || atoi(getenv("STRIX_KVCHAIN_LIVE")) != 0;
+                            if (live_on && kv_chain && slot.task->params.cache_prompt && slot.task_prev
+                                    && slot.kv_chain_ans_cells > 0) {
+                                const int64_t fork = slot.kv_chain_ans_cells;
+                                const int64_t lcp  = slot.task_prev->tokens.get_common_prefix(input_tokens);
+                                const llama_pos pmax = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+                                if (lcp == fork && (int64_t) input_tokens.size() > fork
+                                        && pmax >= slot.kv_chain_ans_pos) {
+                                    const size_t n_set = llama_state_seq_set_data_ext(ctx_tgt,
+                                            slot.kv_chain_ans_state.data(), slot.kv_chain_ans_state.size(),
+                                            slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                    if (n_set > 0) {
+                                        // the draft's memory goes with the target's: a stale draft accepts a
+                                        // different number of tokens, so the target verifies different batch
+                                        // shapes, and a different batch size is a different FP reduction
+                                        // order -- enough to fork a greedy answer. Same lesson as tail-only.
+                                        if (ctx_dft != nullptr) {
+                                            llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, 0, -1);
+                                        }
+                                        // rebuild the prompt buffer over the fork's cells. an image inside the
+                                        // prefix goes in as a PLACEHOLDER: its rows are already in the KV and
+                                        // its pixels must never be encoded a second time.
+                                        for (int64_t i = 0; i < fork; ++i) {
+                                            if (input_tokens[i] == LLAMA_TOKEN_NULL) {
+                                                const mtmd_input_chunk * chunk = input_tokens.find_chunk(i).get();
+                                                const size_t n = mtmd_input_chunk_get_n_tokens(chunk);
+                                                slot.prompt.tokens.push_back_placeholder(chunk);
+                                                i += (int64_t) (n > 0 ? n : 1) - 1;
+                                            } else {
+                                                slot.prompt.tokens.push_back(input_tokens[i]);
+                                            }
+                                        }
+                                        n_past = (int) fork;
+                                        slot.kv_chain_live_resume = true;
+                                        // strixllama: hand the store back the fingerprint a continuation of
+                                        // this prompt needs, so the resumed turn KEEPS extending the chain
+                                        // instead of freezing it. Without it every chunk it saves would be
+                                        // named under the root -- dead bytes -- and the first turn after a
+                                        // restart would pay the whole cost again.
+                                        static const bool resume_save_on =
+                                            !getenv("STRIX_KVCHAIN_RESUME_SAVE")
+                                            || atoi(getenv("STRIX_KVCHAIN_RESUME_SAVE")) != 0;
+                                        if (slot.kv_chain_ans_fp_ok && resume_save_on) {
+                                            kv_chain->set_running_fp(slot.kv_chain_ans_fp);
+                                            slot.kv_chain_next_block = std::min(slot.kv_chain_ans_blk,
+                                                                    slot.kv_chain_blocks.size());
+                                        } else {
+                                            slot.kv_chain_save_parked = true;
+                                            slot.kv_chain_next_block  = slot.kv_chain_blocks.size();
+                                        }
+                                        live_resumed = true;
+                                        // report what the hook will ACTUALLY do, not what the fingerprint
+                                        // would have allowed: a gate that reads this line to decide whether
+                                        // the saver engaged is fooled if it says "saving" while parked.
+                                        SLT_INF(slot, "kv-chain[live]: resumed from the answer start, %lld of %d cells "
+                                                "kept in RAM, nothing read from disk (%zu B state restored, %s)\n",
+                                                (long long) fork, slot.task->n_tokens(), n_set,
+                                                slot.kv_chain_save_parked ? "chain parked" : "chain saving");
+                                    } else {
+                                        SLT_WRN(slot, "%s", "kv-chain[live]: state restore failed, using the disk chain");
+                                    }
+                                } else {
+                                    SLT_DBG(slot, "kv-chain[live]: not a clean continuation (fork=%lld lcp=%lld input=%zu pmax=%d ans_pos=%d)\n",
+                                            (long long) fork, (long long) lcp, input_tokens.size(),
+                                            (int) pmax, (int) slot.kv_chain_ans_pos);
+                                }
+                            }
+                        }
                         // slot.prompt.n_tokens() == 0 here: the stale previous-task
                         // buffer was dropped above (kv-chain block), so the restore
                         // appends into an empty buffer. the pre-restore seq_rm still
@@ -6764,6 +6972,13 @@ private:
                                     break;
                                 }
                                 kv_chain->fold_glue(slot.ctx_tgt, slot.id, blk.pos_lo, blk.pos_hi);
+                                // strixllama: same fingerprint bookkeeping as the text hook -- an image can
+                                // be the last block a prompt handles, and a continuation needs its fp.
+                                slot.kv_chain_cur_fp_in  = kv_chain->entry_fp_used();
+                                slot.kv_chain_cur_fp_out = kv_chain->running_fp();
+                                slot.kv_chain_cur_fp_blk = slot.kv_chain_next_block;
+                                slot.kv_chain_cur_fp_img = true;
+                                slot.kv_chain_cur_fp_ok  = true;
                                 SLT_DBG(slot, "kv-chain[glue]: folded image at decode pos=[%d,%d) cells=[%lld,%lld)\n",
                                         (int) blk.pos_lo, (int) blk.pos_hi,
                                         (long long) blk.cell_lo, (long long) blk.cell_hi);
@@ -7416,6 +7631,52 @@ private:
                         slot.prompt.checkpoints.back().logits.assign(lg, lg + llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_tgt))));
                     }
                 }
+
+                // strixllama: kv-chain keeps no rung at the answer's start -- the disk walk stops at the
+                // conversation's first image -- so take one here, in the slot, from the state as it stands
+                // now that the prompt is fully committed. This is what lets the NEXT request of a continuing
+                // conversation resume from the fork instead of rewinding to the first image and re-prefilling
+                // (and re-encoding) everything in between. PARTIAL_ONLY = the recurrent part alone; the
+                // attention rows stay in RAM. Measured on this box: ~113 MiB, one D2H per turn.
+                if (kv_chain) {
+                    slot.kv_chain_ans_state.clear();
+                    slot.kv_chain_ans_cells = -1;
+                    slot.kv_chain_ans_pos   = -1;
+                    slot.kv_chain_ans_fp_ok = false;
+                    // publish the prompt's last chunk so the fingerprint bookkeeping below is complete, then
+                    // resolve what a continuation would need. Only trust it if the hook actually walked the
+                    // schedule to the end: a cursor left short means the recorded block is not the prompt's
+                    // last one, and a wrong fingerprint would name chunks no cold run ever asks for.
+                    kv_chain->flush();
+                    if (slot.kv_chain_cur_fp_ok &&
+                            slot.kv_chain_next_block >= slot.kv_chain_blocks.size()) {
+                        slot.kv_chain_ans_fp    = slot.kv_chain_cur_fp_img ? slot.kv_chain_cur_fp_out
+                                                                          : slot.kv_chain_cur_fp_in;
+                        slot.kv_chain_ans_blk   = slot.kv_chain_cur_fp_img ? slot.kv_chain_cur_fp_blk + 1
+                                                                          : slot.kv_chain_cur_fp_blk;
+                        slot.kv_chain_ans_fp_ok = true;
+                    }
+                    const size_t sz = llama_state_seq_get_size_ext(ctx_tgt, slot.id,
+                            LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    if (sz > 0 && sz <= KVCHAIN_ANS_STATE_MAX) {
+                        std::vector<uint8_t> buf(sz);
+                        if (llama_state_seq_get_data_ext(ctx_tgt, buf.data(), sz, slot.id,
+                                    LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == sz) {
+                            slot.kv_chain_ans_state = std::move(buf);
+                            slot.kv_chain_ans_cells = slot.prompt.n_tokens();
+                            slot.kv_chain_ans_pos   = llama_memory_seq_pos_max(
+                                    llama_get_memory(ctx_tgt), slot.id);
+                            SLT_INF(slot, "kv-chain[live]: answer-start state kept, %zu B at %lld cells (pos_max=%d)\n",
+                                    slot.kv_chain_ans_state.size(), (long long) slot.kv_chain_ans_cells,
+                                    (int) slot.kv_chain_ans_pos);
+                        } else {
+                            SLT_WRN(slot, "%s", "kv-chain[live]: could not dump the answer-start state");
+                        }
+                    } else if (sz > KVCHAIN_ANS_STATE_MAX) {
+                        SLT_WRN(slot, "kv-chain[live]: answer-start state too big to keep (%zu B > %zu)\n",
+                                sz, (size_t) KVCHAIN_ANS_STATE_MAX);
+                    }
+                }
             } else if (slot.state != SLOT_STATE_GENERATING) {
                 return;
             }
@@ -7573,7 +7834,9 @@ private:
                 n_accepted--;
             }
             if (!slot.spec_is_replay) {
-                note_spec_len(slot, n_accepted);
+                // n_draft is the width actually verified, which is what makes a position an
+                // observation: a pass that drafted 2 says nothing about position 2
+                note_draft_len(slot, n_accepted, n_draft);
             }
             slot.spec_is_replay = false;
 

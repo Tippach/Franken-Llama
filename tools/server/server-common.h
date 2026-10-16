@@ -353,6 +353,9 @@ struct server_chat_params {
     std::string reasoning_budget_message;
     std::string media_path;
     bool force_pure_content = false;
+    // strixllama: server default for the loop breaker sampler. NOTE: this struct is
+    // aggregate-initialized positionally in server-context.cpp, so new members go last.
+    bool loop_breaker = false;
 };
 
 // used by /completions endpoint

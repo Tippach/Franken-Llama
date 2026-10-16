@@ -1591,8 +1591,27 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         // later text ubatch, and the cache cannot track ranked cells (it asserts !ranked).
         qsa->kb_dup = mctx_hyb->kb_pos_dup();
         qsa->kb_seq_off = mctx_hyb->kb_seq_unusable(ubatch);
+        // strixllama DEV: STRIXLLAMA_KB_FORCE=1 makes the graph-build gate IGNORE the two sticky conditions
+        // (kb_dup / kb_seq_off) so the decode graph ALWAYS wires the block-key cache and takes the
+        // incremental branch. This is the R2 discriminator: if the fill-time assert (!ranked) fires, the
+        // cells really are ranked and R2 must re-key cache rows on rank; if it runs and stays bit-identical,
+        // the sticky flags were over-conservative and R2 reduces to not setting them on a clean restore.
+        // Default OFF: one static bool read, zero cost when unset. TIMING/DIAGNOSTIC ONLY when on.
+        static const bool kb_force = getenv("STRIXLLAMA_KB_FORCE") && atoi(getenv("STRIXLLAMA_KB_FORCE"));
+        const bool kb_gate_dup = kb_force ? false : qsa->kb_dup;
+        const bool kb_gate_off = kb_force ? false : qsa->kb_seq_off;
+        // strixllama DEV: STRIXLLAMA_KB_WHY=1 names WHICH condition blocks the cache at graph-build time,
+        // per ubatch, so the shipping MTP config can be told apart from an AR one without guessing: kb_dup
+        // (draft position gaps / image) vs kb_seq_off (a restore) vs pos_scalar/n_stream. R2 must relax the
+        // one that actually fires in shipping; relaxing the other buys nothing.
+        static const bool kb_why = getenv("STRIXLLAMA_KB_WHY") && atoi(getenv("STRIXLLAMA_KB_WHY"));
+        if (kb_why && il == 3 && n_tps <= 4) {
+            fprintf(stderr, "KB_WHY: n_tps=%lld stream=%d dup=%d seq_off=%d pos_scalar=%d kbobj=%d\n",
+                    (long long) n_tps, (int) n_stream, (int) qsa->kb_dup, (int) qsa->kb_seq_off,
+                    (int) qwen4exp_pos_scalar(ubatch), mctx_hyb->get_kb(il) != nullptr);
+        }
         if (mctx_hyb->get_kb(il) != nullptr && n_stream == 1 && qwen4exp_pos_scalar(ubatch) &&
-                !qsa->kb_dup && !qsa->kb_seq_off) {
+                !kb_gate_dup && !kb_gate_off) {
             // strixllama: a ubatch of several sequences can complete up to two blocks per sequence, and each can bring
             // the blocks of up to kb_pending_max positions a graph without the indexer left (kb_note_unrefreshed)
             const int64_t dirty_max = qwen4exp_kb_dirty_max(n_tps, r, ubatch.n_seqs_unq);
@@ -1657,6 +1676,19 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     // wrap the externally owned cache in a ctx0 view, as the KV cache does through get_k()
     ggml_tensor * kb = kb_raw ? ggml_view_2d(ctx0, kb_raw, kb_raw->ne[0], kb_raw->ne[1], kb_raw->nb[1], 0) : nullptr;
     ggml_tensor * pooled = nullptr;
+    // strixllama DEV: STRIXLLAMA_KB_BRANCH=1 names, at GRAPH BUILD time, which block-key branch this graph
+    // captures and at what width. The byte census (SKIP_DUMP=3) runs at capture too, so capture and replay
+    // look identical - but a CUDA graph is keyed by STRUCTURE and replayed unchanged, so a graph captured on
+    // the full-rebuild branch (kb_stale set at reserve / first token) keeps re-materialising all n_blocks keys
+    // every token even after kb_needs_full() returns false. That is why STRIXLLAMA_KB_NOFULL is a no-op on the
+    // replayed graph (KB_FULL=0 in both arms yet the [128,n_blocks] CONT/ADD stay): the knob changes a branch
+    // the cached graph already committed to. This line prints once per build so the census can be attributed to
+    // the graph that actually replays.
+    if (getenv("STRIXLLAMA_KB_BRANCH") && atoi(getenv("STRIXLLAMA_KB_BRANCH"))) {
+        fprintf(stderr, "KB_BRANCH: il=%d full=%d kb=%d n_blocks=%lld n_tps=%u dirty_max=%lld n_stream=%d\n",
+                il, (int) inp->kb_full, kb != nullptr, (long long) n_blocks, ubatch.n_tokens,
+                kb && !inp->kb_full ? (long long) inp->kb_dirty_dst->ne[0] : -1LL, (int) n_stream);
+    }
     if (kb && !inp->kb_full) {
         const int64_t dirty_max = inp->kb_dirty_dst->ne[0];
         ggml_tensor * fresh = build_block_keys(inp->kb_dirty_cells, inp->kb_dirty_pos, dirty_max);

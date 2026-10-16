@@ -310,6 +310,25 @@ public:
     bool   enabled() const { return !root_dir.empty(); }
     int32_t ubatch_size() const { return ubatch_size_; }
     uint64_t root_hash() const { return root_hash_; }
+
+    // strixllama: the fingerprint a live resume has to hand back. A resumed prompt skips the walk, so
+    // running_fp_ sits at the root and every chunk it goes on to save would be named under the root --
+    // a name no cold run produces, i.e. dead bytes. The server remembers the entry fingerprint of the
+    // block the next prompt forks inside (see entry_fp_used) and restores it here before the save hook
+    // runs, so the resumed turn names its chunks exactly as a cold run of that prompt would.
+    void set_running_fp(uint64_t fp) { running_fp_ = fp; }
+
+    // strixllama: the store's current running fingerprint. For a folded glue block this is already the
+    // value AFTER the fold (fold_glue is synchronous); for a saved chunk it only becomes the value after
+    // that chunk once the pipeline publishes it, so read it after flush() to get the whole prefix.
+    uint64_t running_fp() const { return running_fp_; }
+
+    // strixllama: the entry fingerprint of the block save()/fold_glue() just handled -- the running fp
+    // as it stood when that block's name was formed (save) or its bytes folded (fold_glue). Read it
+    // right after the call: it is the value the NEXT block's name builds on once this one's bytes are
+    // folded, and the only one the server can key a per-block ladder to, because the pipeline advances
+    // running_fp_ for a saved chunk later, at publish time.
+    uint64_t entry_fp_used() const { return last_entry_fp_; }
     // true when the model has compressed K caches (arch deepseek4): then each
     // chunk also gets a .cmcache file (the chunk's COMP_ONLY comp rows) and the
     // .rscache is rings-only. non-dsv4 archs: false, two files, no cm loop.
@@ -414,6 +433,10 @@ private:
     // (see begin_prompt/save/fold_glue). reset to root_hash_ per prompt, advanced by save() and
     // fold_glue(), and threaded forward by load_prefix() over the restored prefix.
     uint64_t    running_fp_ = 0;
+    // the entry fp of the block save()/fold_glue() most recently handled (see entry_fp_used). Set after
+    // the pipeline is advanced and before the name is formed / the bytes folded, so it is exactly the
+    // value that block's name was built on.
+    uint64_t    last_entry_fp_ = 0;
     // monotonic commit-point counter for the current prompt; keys tail-stride (chunks are no
     // longer uniform-width once an image is present, so pos_lo/ubs can't be used for that).
     size_t      boundary_index_ = 0;
