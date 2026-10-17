@@ -7198,9 +7198,13 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     }
 
     {
-        for (int i = 0; i < cgraph->n_nodes; ++i) {
+        for (int i =  0; i < cgraph->n_nodes; ++i) {
             const ggml_tensor * t = cgraph->nodes[i];
             if (t->op == GGML_OP_MUL_MAT && (t->src[0]->type == GGML_TYPE_IQ4_NL || t->src[0]->type == GGML_TYPE_Q6_K) && ggml_cuda_mmb_supported_mm(t->src[0], t->src[1], t)) ggml_cuda_mmb_shadow_prepare(*cuda_ctx, t->src[0]);
+            // strixllama: the dense Q4_K/Q5_K/IQ4_XS shadow must be created BEFORE supported_mm can accept the
+            // weight (that predicate requires the shadow to already exist), so this call is NOT gated on
+            // supported_mm - shadow_prepare itself checks residency, the gate, and the cap.
+            if (t->op == GGML_OP_MUL_MAT && ggml_cuda_mmb_shadow_kq_wanted(t->src[0])) ggml_cuda_mmb_shadow_prepare(*cuda_ctx, t->src[0]);
             if (t->op == GGML_OP_MUL_MAT && t->src[0]->type == GGML_TYPE_F32 && t->src[0]->ne[1] <= 64 && t->src[1]->ne[1] > 64) ggml_cuda_mmb_f16w_prepare(*cuda_ctx, t->src[0]);
         }
     }

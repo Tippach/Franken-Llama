@@ -1753,6 +1753,74 @@ __global__ void mmb_dq_iq4nl_bf16_kernel(const uint8_t * __restrict__ W, uint16_
         o[2*w] = mmb_pack2(l0, l1); o[2*w + 1] = mmb_pack2(l2, l3); o[8 + 2*w] = mmb_pack2(h0, h1); o[8 + 2*w + 1] = mmb_pack2(h2, h3);
     }
 }
+
+// strixllama: the 6-bit scale/min unpack of the K-quant superblocks, byte-for-byte the same as
+// get_scale_min_k4 in dequantize.cuh. Local here so the shadow kernel does not pull that header in.
+static __device__ __forceinline__ void mmb_scale_min_k4(int j, const uint8_t * q, uint8_t & d, uint8_t & m) {
+    if (j < 4) { d = q[j] & 63; m = q[j + 4] & 63; }
+    else       { d = (q[j+4] & 0xF) | ((q[j-4] >> 6) << 4); m = (q[j+4] >> 4) | ((q[j-0] >> 6) << 4); }
+}
+
+// strixllama: load-time BF16 shadow of the DENSE K-quant weights that an ISTA GSQ-RCO file puts on the
+// attention/SSM/shared-expert projections (Q5_K / Q4_K / IQ4_XS). Those types are not in the fused
+// supported_mm set, so every prefill ubatch re-dequantizes them in the MMQ inner loop; here they are
+// dequantised ONCE to the same row-major BF16 plane the Q6_K shadow produces (out[g] = bf16(value)),
+// so the existing dequant-free dense GEMM (WTYPE 2) runs them instead. One thread per weight; the
+// per-superblock scale/min is recomputed per weight to keep the kernel simple - this runs at load, not
+// in the hot loop. Dequant arithmetic mirrors dequantize_q4_K / dequantize_q5_K / dequantize_iq4_xs.
+// WQ: 0 = Q4_K, 1 = Q5_K, 2 = IQ4_XS.
+template <int WQ>
+__global__ void mmb_dq_kq_bf16_kernel(const uint8_t * __restrict__ W, uint16_t * __restrict__ out, const int64_t nrows, const int64_t K) {
+    const int64_t g = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;   // global weight index
+    if (g >= nrows * K) return;
+    const int64_t row = g / K;
+    const int64_t k   = g - row * K;
+    const int     ib  = (int) (k / QK_K);                // superblock index within the row
+    const int     l   = (int) (k - (int64_t) ib * QK_K); // offset within the superblock, 0..255
+    float v = 0.f;
+    if (WQ == 0) {                                      // Q4_K: 144 B/superblock, 4-bit + per-subblock scale/min
+        const block_q4_K * x = (const block_q4_K *) W;
+        const int64_t sb = row * (K / QK_K) + ib;
+        const float dall = __low2half(x[sb].dm), dmin = __high2half(x[sb].dm);
+        const int il = l / 64;                          // 0..3 group
+        const int o  = l % 64;                          // 0..63 within the group
+        const int ir = (o % 32) / 4, jj = o % 4;        // n=4 packing: byte = 32*il + 4*ir + jj
+        const int qbyte = 32 * il + 4 * ir + jj;
+        const int nib = (o < 32) ? (x[sb].qs[qbyte] & 0xF) : (x[sb].qs[qbyte] >> 4);
+        const int sc  = 2 * il + (o < 32 ? 0 : 1);
+        uint8_t sd, sm; mmb_scale_min_k4(sc, x[sb].scales, sd, sm);
+        v = (dall * sd) * (float) nib - (dmin * sm);
+    } else if (WQ == 1) {                               // Q5_K: 176 B/superblock, 5-bit (4-bit qs + 1-bit qh)
+        const block_q5_K * x = (const block_q5_K *) W;
+        const int64_t sb = row * (K / QK_K) + ib;
+        const float dall = __low2half(x[sb].dm), dmin = __high2half(x[sb].dm);
+        const int il = l / 64;                          // 0..3 group
+        const int o  = l % 64;                          // 0..63 within the group
+        const int ir = (o % 32) / 2, pair = o % 2;      // 2-wide write: qbyte = 32*il + 2*ir + pair
+        const int qbyte  = 32 * il + 2 * ir + pair;
+        const int qhbyte = 2 * ir + pair;
+        const int hmshift = (o < 32) ? (2 * il) : (2 * il + 1);
+        const int qlo = (o < 32) ? (x[sb].qs[qbyte] & 0xF) : (x[sb].qs[qbyte] >> 4);
+        const int qhi = (x[sb].qh[qhbyte] & (1 << hmshift)) ? 16 : 0;
+        const int is  = 2 * il + (o < 32 ? 0 : 1);
+        uint8_t sd, sm; mmb_scale_min_k4(is, x[sb].scales, sd, sm);
+        v = (dall * sd) * (float) (qlo + qhi) - (dmin * sm);
+    } else {                                            // IQ4_XS: 68 B/superblock, 4-bit + 6-bit-per-subblock scales
+        const block_iq4_xs * x = (const block_iq4_xs *) W;
+        const int64_t sb = row * (K / QK_K) + ib;
+        const int ibb = l / 32;                         // 0..7 sub-block
+        const int g   = l % 32;                         // 0..31 within the sub-block
+        const int half = g >= 16;                       // low nibble (y[j]) vs high nibble (y[j+16])
+        const int gg  = half ? g - 16 : g;              // 0..15: 4*il + j
+        const int qbyte = 16 * ibb + gg;                // == 16*ibb + 4*(gg/4) + gg%4
+        const int nib = half ? (x[sb].qs[qbyte] >> 4) : (x[sb].qs[qbyte] & 0xF);
+        const int sl = (x[sb].scales_l[ibb / 2] >> (4 * (ibb % 2))) & 0xF;
+        const int sh = (x[sb].scales_h >> (2 * ibb)) & 3;
+        const float d = (float) x[sb].d * (float) ((sl | (sh << 4)) - 32);
+        v = d * (float) mmb_kv_iq4nl[nib];
+    }
+    out[g] = mmb_f2bf(v);
+}
 static std::unordered_map<const void *, uint16_t *> g_mmb_shadow;
 static std::map<std::pair<const void *, const void *>, uint16_t *> g_mmb_shadow_pair;   // concat(w0, w1) along rows -> BF16 copy
 static size_t g_mmb_shadow_bytes = 0;
@@ -1761,6 +1829,15 @@ bool   mmb_shadow()    { return mmb_shadow_mode() != 0; }
 bool   mmb_shadow_q6k(){ return mmb_shadow_mode() >= 1; }
 size_t mmb_shadow_cap(){ static const long v = getenv("LLAMA_MMB_SHADOW_MB") ? atol(getenv("LLAMA_MMB_SHADOW_MB")) : 6144; return (size_t) v << 20; }
 static bool mmb_is_resident_q6k(const ggml_tensor * w) { return w && w->type == GGML_TYPE_Q6_K && w->op == GGML_OP_NONE && w->data && w->buffer && w->ne[2] == 1 && w->ne[3] == 1 && ggml_is_contiguous(w) && w->ne[0] % 256 == 0 && w->ne[1] <= 32768; }
+// strixllama: the dense Q4_K/Q5_K/IQ4_XS weights an ISTA GSQ-RCO file uses for the attention/SSM/shared-expert
+// projections. Same residency rules as the Q6_K shadow (a single 2-D contiguous weight on the device, K a multiple
+// of the 256-weight superblock, M within the shadow index range). STRIX_MMB_SHADOW_KQ=0 sends them back to MMQ.
+static bool mmb_shadow_kq() { static const bool v = !getenv("STRIX_MMB_SHADOW_KQ") || atoi(getenv("STRIX_MMB_SHADOW_KQ")) != 0; return v && mmb_shadow(); }
+static bool mmb_is_resident_kq(const ggml_tensor * w) {
+    return w && (w->type == GGML_TYPE_Q4_K || w->type == GGML_TYPE_Q5_K || w->type == GGML_TYPE_IQ4_XS)
+        && w->op == GGML_OP_NONE && w->data && w->buffer && w->ne[2] == 1 && w->ne[3] == 1
+        && ggml_is_contiguous(w) && w->ne[0] % 256 == 0 && w->ne[1] <= 32768;
+}
 static bool mmb_is_resident_iq4(const ggml_tensor * w) { return w && w->type == GGML_TYPE_IQ4_NL && w->op == GGML_OP_NONE && w->data && w->buffer && w->ne[2] == 1 && w->ne[3] == 1 && ggml_is_contiguous(w); }
 static bool mmb_is_row_concat(const ggml_tensor * w) {
     return w && w->op == GGML_OP_CONCAT && w->type == GGML_TYPE_IQ4_NL && ggml_get_op_params_i32(w, 0) == 1 && mmb_is_resident_iq4(w->src[0]) && mmb_is_resident_iq4(w->src[1]) &&
@@ -1864,7 +1941,8 @@ bool ggml_cuda_mmb_supported_mm(const ggml_tensor * src0, const ggml_tensor * sr
     if (!mmb_enabled()) return false;
     const bool quant = src0->type == GGML_TYPE_IQ4_NL || src0->type == GGML_TYPE_Q8_0 ||
                        (src0->type == GGML_TYPE_Q6_K && mmb_shadow_q6k() && mmb_is_resident_q6k(src0) &&
-                        mmb_shadow_lookup(src0) != nullptr);
+                        mmb_shadow_lookup(src0) != nullptr) ||
+                       (mmb_shadow_kq() && mmb_is_resident_kq(src0) && mmb_shadow_lookup(src0) != nullptr);
     const bool bf16w = src0->type == GGML_TYPE_BF16 && mmb_bf16w();
     const bool f32w  = src0->type == GGML_TYPE_F32 && mmb_f32split();
     if ((!quant && !bf16w && !f32w) || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
@@ -2016,7 +2094,8 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
         static unsigned hits = 0; if (hits++ < 2) fprintf(stderr, "MMB_TALL%s dense M=%d K=%d T=%d type=%s\n", wide ? "(wide 384x64)" : "(384x32)", M, K, T, ggml_type_name(src0->type));
         return;
     }
-    const uint16_t * shadow_pre = ((src0->type == GGML_TYPE_IQ4_NL && mmb_shadow()) || src0->type == GGML_TYPE_Q6_K) ? mmb_shadow_lookup(src0) : nullptr;
+    const bool mmb_kq_w = mmb_shadow_kq() && mmb_is_resident_kq(src0);
+    const uint16_t * shadow_pre = ((src0->type == GGML_TYPE_IQ4_NL && mmb_shadow()) || src0->type == GGML_TYPE_Q6_K || mmb_kq_w) ? mmb_shadow_lookup(src0) : nullptr;
     const bool big = (M >= 6144 && K >= 2560) || (shadow_pre && K >= 2560 && T >= 4096);
     uint16_t * Dh = (mmb_hc16() && K == 320 && M == 10240) ? ggml_cuda_mmb_slot_reserve(ctx, 1, dst, (size_t) T * M) : nullptr;
     bool store_f32 = !(Dh && ggml_cuda_mmb_is_bf16_only(dst));
@@ -2309,6 +2388,12 @@ void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_te
     CUDA_CHECK(cudaGetLastError());
 }
 
+// strixllama: exported predicate for the graph_optimize trigger - true when a dense weight is a K-quant
+// (Q4_K/Q5_K/IQ4_XS) that the shadow path wants, so the shadow is created before supported_mm can accept it.
+bool ggml_cuda_mmb_shadow_kq_wanted(const ggml_tensor * w) {
+    return mmb_enabled() && mmb_shadow_kq() && mmb_is_resident_kq(w) && g_mmb_shadow.count(w ? w->data : nullptr) == 0;
+}
+
 // Called from graph_optimize (outside stream capture): create the shadow for an eligible IQ4_NL dense weight.
 void ggml_cuda_mmb_shadow_prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * w) {
     if (!w) return;
@@ -2322,6 +2407,23 @@ void ggml_cuda_mmb_shadow_prepare(ggml_backend_cuda_context & ctx, const ggml_te
         CUDA_CHECK(cudaGetLastError());
         g_mmb_shadow[w->data] = buf; g_mmb_shadow_bytes += bytes;
         static unsigned q6 = 0; if (q6++ < 3) fprintf(stderr, "MMB_SHADOW Q6_K %s [%lld x %lld] -> BF16 (%.1f MB total)\n", w->name, (long long) w->ne[0], (long long) w->ne[1], g_mmb_shadow_bytes / 1048576.0);
+        return;
+    }
+    if (mmb_shadow_kq() && mmb_is_resident_kq(w)) {
+        if (g_mmb_shadow.count(w->data) > 0) return;
+        const int64_t K = w->ne[0], M = w->ne[1];
+        const size_t n = (size_t) K * M, bytes = n * 2;
+        if (g_mmb_shadow_bytes + bytes > mmb_shadow_cap()) { fprintf(stderr, "MMB_SHADOW cap reached; %s stays %s\n", w->name, ggml_type_name(w->type)); return; }
+        uint16_t * buf = nullptr;
+        if (cudaMalloc((void **) &buf, bytes) != cudaSuccess) { fprintf(stderr, "MMB_SHADOW alloc failed (%zu bytes)\n", bytes); return; }
+        const int wq = w->type == GGML_TYPE_Q4_K ? 0 : w->type == GGML_TYPE_Q5_K ? 1 : 2;
+        const unsigned grid = (unsigned) ((n + 255) / 256);
+        if (wq == 0)      mmb_dq_kq_bf16_kernel<0><<<grid, 256, 0, ctx.stream()>>>((const uint8_t *) w->data, buf, M, K);
+        else if (wq == 1) mmb_dq_kq_bf16_kernel<1><<<grid, 256, 0, ctx.stream()>>>((const uint8_t *) w->data, buf, M, K);
+        else              mmb_dq_kq_bf16_kernel<2><<<grid, 256, 0, ctx.stream()>>>((const uint8_t *) w->data, buf, M, K);
+        CUDA_CHECK(cudaGetLastError());
+        g_mmb_shadow[w->data] = buf; g_mmb_shadow_bytes += bytes;
+        static unsigned kq = 0; if (kq++ < 3) fprintf(stderr, "MMB_SHADOW_KQ %s %s [%lld x %lld] -> BF16 (%.1f MB total)\n", w->name, ggml_type_name(w->type), (long long) w->ne[0], (long long) w->ne[1], g_mmb_shadow_bytes / 1048576.0);
         return;
     }
     if (mmb_shadow_mode() != 1) return;               // mode 2: Q6_K only

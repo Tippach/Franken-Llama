@@ -47,7 +47,7 @@ REM                 the cache unquantized.
 REM  The defaults below are the validated shipping config: two 512k conversations with
 REM  YaRN and the KV cache at q8_0. A shell can still override any of them.
 REM ============================================================================
-if not defined VISION set "VISION=0"
+if not defined VISION set "VISION=1"
 if not defined PARALLEL set "PARALLEL=2"
 if not defined YARN set "YARN=1"
 if not defined CTX set "CTX=524288"
@@ -129,11 +129,11 @@ if "%PARALLEL%"=="1" (
   set "KV_MODE=--kv-unified"
 )
 
-REM --- vision / image input (opt-in; default OFF = text only) ---------------------
+REM --- vision / image input (default ON; set VISION=0 for text only) -------------
 REM   VISION=1            auto-resolve the model repo's vision projector (adds ~865 MB
 REM                       download and offloads it in addition to the context)
 REM   MMPROJ=<file.gguf>  explicit local projector; implies VISION=1
-if not defined VISION set "VISION=0"
+if not defined VISION set "VISION=1"
 if defined MMPROJ set "VISION=1"
 
 REM --- HTTPS / TLS (opt-in; default OFF = plain HTTP on loopback) ------------------

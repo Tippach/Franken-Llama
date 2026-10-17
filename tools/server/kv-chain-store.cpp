@@ -143,6 +143,50 @@ kv_chain_store::kv_chain_store(std::string root_dir, uint64_t limit_bytes, int32
     // seed the running block-chain fingerprint: every prompt resets it to root_hash_
     // (begin_prompt), and root_hash_ is also the parent of chunk 0's content hash.
     running_fp_ = root_hash_;
+
+    // root-identity stamp: the root hash folds in the KV cache type, the rope config, n_seq_max,
+    // the chunk width and the model identity, so ANY of those changing orphans every chunk already
+    // on disk -- they can never be named again. That is clean (a miss, never corruption), but it is
+    // invisible: the dir just silently stops hitting and the whole corpus re-prefills. Record the
+    // root that owns the dir and say out loud when it changes, so a KVQ8/CACHE/CTX/PARALLEL flip
+    // reads as "N bytes are now unreachable" instead of "the cache mysteriously stopped working".
+    // Written by the kv-chain arm only; the launcher's own owner.txt covers the mechanism flip,
+    // this covers the identity flip inside one mechanism.
+    {
+        const fs::path stamp = cache_dir / "root.txt";
+        std::string prev;
+        {
+            std::ifstream in(stamp);
+            if (in) {
+                std::getline(in, prev);
+            }
+        }
+        const std::string now = hash_str(root_hash_);
+        if (prev.empty()) {
+            // first run (or no stamp yet): nothing to compare against, just record.
+            std::ofstream out(stamp, std::ios::trunc);
+            if (out) {
+                out << now << "\n";
+            }
+        } else if (prev != now) {
+            size_t n_chunk = 0, bytes_chunk = 0;
+            for (const auto & entry : fs::directory_iterator(cache_dir, fs::directory_options::skip_permission_denied)) {
+                if (entry.is_regular_file() && entry.path().extension() == ".kvcache") {
+                    ++n_chunk;
+                    bytes_chunk += static_cast<size_t>(entry.file_size());
+                }
+            }
+            SRV_WRN("kv-chain[storage]: root changed %s -> %s: the KV type / rope config / n_seq_max / "
+                    "chunk width / model identity moved, so %zu cached chunk file(s) (%.1f GiB) are now "
+                    "unreachable and will be re-prefilled as conversations return\n",
+                    prev.c_str(), now.c_str(), n_chunk, (double) bytes_chunk / (1024.0*1024.0*1024.0));
+            std::ofstream out(stamp, std::ios::trunc);
+            if (out) {
+                out << now << "\n";
+            }
+        }
+    }
+
     SRV_INF("kv-chain[storage]: cache dir '%s', root=%s, %zu bytes on disk, %.1f GiB (limit %.1f GiB), chunk ub=%d\n",
             cache_dir.string().c_str(), hash_str(root_hash_).c_str(), (size_t) total_bytes_cur.load(),
             (double) total_bytes_cur.load() / (1024.0*1024.0*1024.0),

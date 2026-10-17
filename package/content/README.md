@@ -7,6 +7,7 @@ external requirement is the installed AMD graphics driver. HTTPS/TLS is built in
 ## Contents
 ```
 launcher\strix.bat            double-click launcher (no gate setup: the binary bakes them)
+launcher\strix_gui.exe        graphical launcher: pick a checkpoint, tick the knobs, watch live stats
 launcher\chat_template.jinja  Qwen3.8-Flash-Next chat template (optional; model-embedded works too)
 runtime\                      llama-server.exe + the DLLs it actually imports (20 modules) +
                               rocblas/hipblaslt kernel data. Nothing else from the build ships:
@@ -42,13 +43,17 @@ An already-set environment value always wins over the file's default:
   repo root (default: `MTP/mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf`)
 - `LATIN`      — `1` trims the draft's borrowed LM head to a 32768-token Latin shortlist **at load**
   (default `1`); `0` keeps the full-vocabulary head. See "Speculative decode (MTP draft)".
-- `CTX`    — context size in tokens (default 262144, the size the model was trained on)
-- `YARN`     — `1` enables YaRN rope scaling so `CTX` can exceed the trained 262144 (default `0`)
+- `CTX`    — context size in tokens (default 524288). The model is trained to 262144, so the default
+  context rides on `YARN=1`; set `YARN=0` to stay inside the trained range.
+- `YARN`     — `1` enables YaRN rope scaling so `CTX` can exceed the trained 262144 (default `1`)
 - `YARN_SCALE` — YaRN expansion factor when `YARN=1`; usable context is about 262144 x `YARN_SCALE`
   (default `2`)
 - `PORT`   — listen port (default 9931)
 - `HOSTIP` — bind address (default 127.0.0.1)
-- `PARALLEL`   — concurrent conversations / slots (default `1`)
+- `PARALLEL`   — concurrent conversations / slots (default `2`)
+- `KVQ8`       — `1` stores the KV cache, and the MTP draft's, as q8_0 instead of f16 (default `1`);
+  `0` keeps both unquantized. Roughly halves the cache — about 6.4 GB at 512k context. See
+  "Context size and YaRN".
 - `CACHE`      — prompt cache on disk: `kvchain` (default) / `disk` / `auto` / `off`. Exactly one
   mechanism runs — the server refuses to start with both. See "Prompt cache on disk".
 - `KVCHAIN_GB` — disk quota in GiB for kv-chain mode (default 100)
@@ -56,42 +61,48 @@ An already-set environment value always wins over the file's default:
 - `SSL`        — `1` serves HTTPS/TLS instead of plain HTTP (default `0`)
 - `SSL_KEY`    — PEM private key path (default `launcher\key.pem`, only used when `SSL=1`)
 - `SSL_CERT`   — PEM certificate chain path (default `launcher\cert.pem`, only used when `SSL=1`)
-- `VISION`     — `1` enables image input by loading a vision projector (default `0`, text only)
+- `VISION`     — `1` enables image input by loading a vision projector (default `1`; `0` = text only)
 - `MMPROJ`     — explicit local projector gguf; implies `VISION=1` and skips auto-resolution
+- `CTPL`       — chat template file to use (default `launcher\chat_template.jinja`). Set it empty to
+  use the template embedded in the model instead.
+- `CACHE_DIR`  — directory holding the on-disk prompt cache (default `launcher\prompt-cache`). The
+  quota knobs above apply inside it; see "Prompt cache on disk".
 
 ## Context size and YaRN
-The model is trained to **262144** tokens, which is the default `CTX`. Within that range no rope
-scaling is wanted or needed.
-
-To go beyond it, enable YaRN, which rescales the rotary positions so longer contexts stay in
-distribution:
+The model is trained to **262144** tokens. The shipping default goes past that: `CTX=524288` together
+with `YARN=1`, so two conversations share a ~512k window out of the box. To stay inside the trained
+range instead, turn YaRN off and drop the context:
 ```
-set YARN=1
-set YARN_SCALE=2
-set CTX=524288
+set YARN=0
+set CTX=262144
 strix.bat
 ```
-`YARN_SCALE` is the expansion factor, so the usable context is roughly `262144 x YARN_SCALE`; the
-example above gives 512k. The launcher passes `--rope-scaling yarn --rope-scale %YARN_SCALE%
+Within the trained range no rope scaling is wanted or needed, and the launcher refuses `YARN=1` while
+`CTX` is still at or below 262144 — scaling there buys nothing and costs accuracy.
+
+YaRN rescales the rotary positions so a longer context stays in distribution. `YARN_SCALE` is the
+expansion factor, so the usable context is roughly `262144 x YARN_SCALE`; the default scale of 2
+gives the default 524288. The launcher passes `--rope-scaling yarn --rope-scale %YARN_SCALE%
 --yarn-orig-ctx 262144`.
 
-Measured on this box at scale 2 / 512k, single slot, KV in f16, `-ub 8192`: the server loads and runs
-using about **97 GB of the ~108 GB available to the GPU** (a 96 GB dedicated carve plus 16 GB of
-shared memory), i.e. roughly 10 GB of headroom. Context beyond that
-needs KV quantisation (f16 KV costs about 6.5 GB per 262k) or a smaller `-ub`.
+Measured on this box at scale 2 / 512k, single slot, KV in **f16** (`KVQ8=0`), `-ub 8192`: the server
+loads and runs using about **97 GB of the ~108 GB available to the GPU** (a 96 GB dedicated carve plus
+16 GB of shared memory), i.e. roughly 10 GB of headroom.
 
-The launcher refuses `YARN=1` while `CTX` is still at or below 262144 — scaling there buys nothing and
-costs accuracy.
+The default KV type is q8_0 (`KVQ8=1`), which roughly halves that cache: f16 costs about 6.5 GB per
+262k of context, q8_0 about 3.2 GB, so the 512k default is about **6.4 GB smaller** than the f16
+figure above. Context beyond that needs a smaller `-ub`.
 
 ## Vision / image input
-Off by default: the shipping command line passes `--no-mmproj`, so the server is text-only and
-no projector is downloaded. The vision tower is fully supported and needs no extra files in the
-package — `runtime\mtmd.dll` is always present (the server imports it statically and cannot start
-without it), and the projector weights come from the same Hugging Face repo as the model.
+On by default: the shipping command line passes `--mmproj-auto`, so the server resolves and
+downloads the repo's projector and image input is available out of the box. The vision tower needs
+no extra files in the package — `runtime\mtmd.dll` is always present (the server imports it
+statically and cannot start without it), and the projector weights come from the same Hugging Face
+repo as the model.
 
-Turn it on:
+Turn it off (text only, no projector download):
 ```
-set VISION=1
+set VISION=0
 strix.bat
 ```
 With a `-hf` checkpoint, `VISION=1` adds `--mmproj-auto`: the server resolves and downloads the
@@ -168,6 +179,36 @@ strix.bat
 That keeps the full-vocabulary head (slower per draft step, but handles all scripts). You can also
 point `MTP` at your own draft file — with `LATIN=1` a local draft must already carry a `d2t` tensor.
 
+## Graphical launcher (`strix_gui.exe`)
+A small native window for the same server, for people who would rather click than edit a file.
+**Double-click `strix_gui.exe`.** It is a self-contained program (no PowerShell, no runtime to
+install) and starts the server with no console window behind it. From a shell it also has headless
+modes: `strix_gui.exe --selftest` prints the exact command line each checkpoint would launch, and
+`--status` reads a server already running on the port.
+It offers a **checkpoint dropdown**, checkboxes for the quick-access knobs (vision, q8_0 KV cache,
+MTP speculative decode, the Latin draft trim, YaRN, HTTPS), a context-size and slot picker, and the
+prompt-cache mode. **Launch** starts the server with no console window; **Stop** shuts it down.
+
+**Serving** defaults to *This computer only* (`127.0.0.1`). *All interfaces* (`0.0.0.0`) publishes the
+endpoint to the local network. An **API key** is optional: set one and clients must send
+`Authorization: Bearer <key>`; leave it blank and the launcher warns that the port is open to your LAN
+(anything on it can use the model and read the conversations), then starts anyway.
+
+While it runs, a status panel polls the server over HTTP and shows the loaded model and type, context
+size, slot count, whether vision is active, uptime, a live **prefill / decode tokens-per-second**
+reading, how many requests are processing or waiting, speculative-draft acceptance, and a per-slot
+view. A coloured light distinguishes starting / ready / idle / stopped, and a tail of the server log
+is shown at the bottom so a failed load is visible instead of silent.
+
+Closing the window offers to stop the server with it; choosing *No* leaves it running, and reopening the
+launcher finds the live server on the port and re-attaches to it (status panel and **Stop** work on it,
+**Launch** stays disabled so a second server is not stacked on the same port). A server started from
+`strix.bat` is adopted the same way.
+
+`strix.bat` remains the way to launch with anything the window does not expose — it is unaffected by
+the GUI, and the two are meant to be used side by side. Nothing is configured in a shell either way:
+the GUI's knobs map one-to-one onto the `strix.bat` variables above and produce the same command line.
+
 ## Requirements / notes
 - GPU: gfx1151 (Radeon 8060S) with its installed driver. No other runtime install needed.
 - HTTPS needs no extra install: `libssl-4-x64.dll` / `libcrypto-4-x64.dll` ship in `runtime\` and
@@ -207,8 +248,15 @@ unified-memory box RAM is tight and SSD is cheap. Exactly one mechanism runs; th
 
 (Legacy: `KVCHAIN=0`/`KVCHAIN=1` still work and map to `CACHE=off`/`CACHE=kvchain`.)
 
-## Multiple slots (`PARALLEL>1`)
-`PARALLEL>1` serves several conversations at once. It **requires** a unified KV cache, which the launcher
-sets for you (`--kv-unified`); with a per-slot cache the dense attention mask returns and reserves ~4 GiB.
-So set only `PARALLEL` and let the launcher pair it with the right cache mode.
-`PARALLEL=1` (default) serves one conversation at a time.
+**Changing the cache format invalidates what is already on disk.** The chain is keyed by a hash of
+the KV cache type (`KVQ8`), the rope scaling (`YARN`/`CTX`), the slot count (`PARALLEL`) and the
+chunk width, so flipping any of them orphans every cached chunk — nothing is corrupted, but the whole
+corpus re-prefills once as conversations return. The server logs one line at startup when this
+happens (`root changed ... N cached chunk file(s) ... are now unreachable`). Budget for that one-time
+re-prefill before changing `KVQ8` on a warm box.
+
+## Multiple slots (`PARALLEL`)
+The default `PARALLEL=2` serves two conversations at once. It **requires** a unified KV cache, which
+the launcher sets for you (`--kv-unified`); with a per-slot cache the dense attention mask returns and
+reserves ~4 GiB. So set only `PARALLEL` and let the launcher pair it with the right cache mode.
+`PARALLEL=1` serves one conversation at a time.

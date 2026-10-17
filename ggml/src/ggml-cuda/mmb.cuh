@@ -44,4 +44,8 @@ void ggml_cuda_hc_xres_set(const void * xn_data, const float * res, const float 
 bool ggml_cuda_mmb_supported_glu(const ggml_tensor * gw, const ggml_tensor * uw, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * glu);
 void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_tensor * gw, const ggml_tensor * uw, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * glu);
 void ggml_cuda_mmb_shadow_prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * w);
+// strixllama: true when a dense weight is a K-quant (Q4_K/Q5_K/IQ4_XS) the shadow path wants and has not
+// yet been shadowed; the graph_optimize trigger uses this because supported_mm only accepts the weight
+// once its shadow already exists.
+bool ggml_cuda_mmb_shadow_kq_wanted(const ggml_tensor * w);
 void ggml_cuda_mmb_release_all();

@@ -82,6 +82,15 @@ if ($SkipBuild) {
 foreach ($need in 'llama-server.exe', 'ggml-hip.dll', 'llama.dll') {
     if (-not (Test-Path (Join-Path $buildBin $need))) { Fail "build\bin lacks $need - build did not produce it" }
 }
+# the GUI launcher is a native Win32 exe compiled from source here (end users cannot build C++, so
+# the package must ship the binary). build_gui.cmd locates vcvars64 via vswhere and runs cl.
+$guiCmd = Join-Path $content 'launcher\build_gui.cmd'
+if (-not (Test-Path $guiCmd)) { Fail "GUI build script missing: $guiCmd" }
+Write-Host "compiling strix_gui.exe (build_gui.cmd)"
+& cmd.exe /c "`"$guiCmd`""
+if ($LASTEXITCODE -ne 0) { Fail "build_gui.cmd exit $LASTEXITCODE" }
+$guiExe = Join-Path $content 'launcher\strix_gui.exe'
+if (-not (Test-Path $guiExe)) { Fail 'strix_gui.exe not produced by build_gui.cmd' }
 
 # ============================================================================
 # 2. STAGE  (closure-derived; no hardcoded DLL list)
@@ -109,7 +118,7 @@ foreach ($d in $dataDirs) {
 # content prerequisites (source-controlled)
 if (Test-Path $launch) { Remove-Item $launch -Recurse -Force }
 New-Item -ItemType Directory -Force -Path $launch | Out-Null
-foreach ($cf in 'launcher\strix.bat', 'launcher\chat_template.jinja') {
+foreach ($cf in 'launcher\strix.bat', 'launcher\chat_template.jinja', 'launcher\strix_gui.exe') {
     $src = Join-Path $content $cf
     if (-not (Test-Path $src)) { Fail "content prerequisite missing: $src" }
     Copy-Item -LiteralPath $src -Destination (Join-Path $launch (Split-Path -Leaf $cf)) -Force
@@ -175,7 +184,23 @@ if ($bat -notmatch '-ctk q8_0 -ctv q8_0 -ctkd q8_0 -ctvd q8_0') { Fail 'bat KVQ8
 if ($bat -notmatch 'set "PC_ARGS=--kv-chain-dir') { Fail 'bat kvchain arm still seeds PC_ARGS with --cache-ram 0' }
 $activeIS = @(($bat -split "`n") | Where-Object { $_ -match '^\s*set\s+LLAMA_MTP_INDEX_SHARE' })
 if ($activeIS.Count) { Fail 'bat actively sets LLAMA_MTP_INDEX_SHARE' }
-Write-Host 'launcher guards: PASS'
+# the GUI launcher ships alongside the bat as a native exe. The real check is functional: run it
+# with --selftest, which prints the command line it would launch and asserts the network guard. A
+# staged exe that is corrupt, truncated, or built against a missing runtime fails here (non-zero).
+$gui = Join-Path $launch 'strix_gui.exe'
+if (-not (Test-Path -LiteralPath $gui)) { Fail 'strix_gui.exe not staged' }
+# strix_gui.exe is a GUI-subsystem binary: launching it via `cmd /c` returns immediately and does
+# not pipe its stdout back, so capture with Start-Process -Wait + a redirect file instead.
+$guiTmp = Join-Path $env:TEMP ("fl_selftest_" + [guid]::NewGuid().ToString('N') + '.txt')
+$gp = Start-Process -FilePath $gui -ArgumentList '--selftest' -Wait -NoNewWindow -PassThru `
+        -RedirectStandardOutput $guiTmp -RedirectStandardError (Join-Path $env:TEMP 'fl_selftest_err.txt')
+$guiTxt = if (Test-Path $guiTmp) { Get-Content -LiteralPath $guiTmp -Raw } else { '' }
+Remove-Item $guiTmp, (Join-Path $env:TEMP 'fl_selftest_err.txt') -Force -EA SilentlyContinue
+if ($gp.ExitCode -ne 0) { Fail ("strix_gui.exe --selftest exit $($gp.ExitCode) : " + ($guiTxt -replace "`n", ' / ')) }
+foreach ($needle in 'UD-IQ4_XS', 'ISTA', '--kv-chain-dir', 'network no-key allowed: yes ; with-key passes --api-key: yes') {
+    if ($guiTxt -notmatch [regex]::Escape($needle)) { Fail "strix_gui.exe --selftest output missing '$needle'" }
+}
+Write-Host 'launcher guards: PASS (strix_gui.exe --selftest)'
 
 # 3d. no bundled draft dir; no key material; README present + documents HTTPS + HF draft
 if (Test-Path (Join-Path $Out 'draft')) { Fail 'Out still contains a draft\ directory' }
@@ -191,6 +216,50 @@ if ($rd -notmatch 'Speculative decode') { Fail 'README has no Speculative decode
 if ($rd -notmatch 'Context size and YaRN') { Fail 'README does not document the YaRN / deep-context knob' }
 if ($rd -match '1\.86 GB|bundled \(1\.86') { Fail 'README still claims a bundled draft' }
 Write-Host 'draft/key/README guards: PASS'
+
+# 3e. README defaults must MATCH the launcher, DERIVED from it.
+# The heading checks above cannot catch a wrong VALUE: they passed green while the README said
+# CTX default 262144 / YARN 0 / PARALLEL 1 while strix.bat set 524288 / 1 / 2, and while KVQ8
+# was not mentioned at all. So parse the bat's own 'if not defined' lines and assert the README
+# restates each default. Same derive-don't-enumerate principle as the DLL closure above.
+$srcBat = Get-Content (Join-Path $content 'launcher\strix.bat') -Raw
+$defaults = @{}
+foreach ($m in [regex]::Matches($srcBat, '(?m)^\s*if not defined (\w+) set "\1=([^"]*)"')) {
+    $k, $v = $m.Groups[1].Value, $m.Groups[2].Value
+    if ($defaults.ContainsKey($k) -and $defaults[$k] -ne $v) {
+        Fail "bat defaults $k twice with DIFFERENT values: '$($defaults[$k])' then '$v'"
+    }
+    $defaults[$k] = $v
+}
+if ($defaults.Count -lt 10) { Fail "parsed only $($defaults.Count) bat defaults - the parser is broken, not the bat" }
+# Pull each README knob bullet: '- `NAME` ...' up to the next bullet / heading / blank line.
+function Get-ReadmeBullet([string] $name) {
+    $lines = $rd -split "`r?`n"
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($lines[$i] -match ('^- `' + [regex]::Escape($name) + '`')) {
+            $out = @($lines[$i]); $j = $i + 1
+            while ($j -lt $lines.Count -and $lines[$j] -notmatch '^\s*- `' -and $lines[$j] -notmatch '^#{1,6} ' -and $lines[$j].Trim() -ne '') {
+                $out += $lines[$j]; $j++
+            }
+            return ($out -join ' ')
+        }
+    }
+    return $null
+}
+$missing = @(); $wrong = @()
+foreach ($k in ($defaults.Keys | Sort-Object)) {
+    $v = $defaults[$k]
+    $bullet = Get-ReadmeBullet $k
+    if (-not $bullet) { $missing += $k; continue }
+    if ($bullet -notmatch 'default') { $wrong += "$k (bullet states no default)"; continue }
+    # A path/repo default (contains %, \ or /) is documented in prose, not verbatim; a bare scalar
+    # must appear literally, which is exactly the class that drifted (CTX 262144 vs 524288).
+    if ($v -match '[%\\/]') { continue }
+    if ($bullet -notmatch [regex]::Escape($v)) { $wrong += "$k (README says a default other than '$v')" }
+}
+if ($missing.Count) { Fail ('README does not document launcher knob(s): ' + ($missing -join ', ')) }
+if ($wrong.Count)   { Fail ('README default disagrees with strix.bat: ' + ($wrong -join '; ')) }
+Write-Host ("README/bat default cross-check: PASS ($($defaults.Count) launcher knobs, values derived from strix.bat)")
 
 if ($NoZip) { Write-Host "`n(-NoZip) staged + verified at $Out"; exit 0 }
 
