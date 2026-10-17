@@ -93,6 +93,25 @@ The default KV type is q8_0 (`KVQ8=1`), which roughly halves that cache: f16 cos
 262k of context, q8_0 about 3.2 GB, so the 512k default is about **6.4 GB smaller** than the f16
 figure above. Context beyond that needs a smaller `-ub`.
 
+### Batch size (`-b` / `-ub`) - a tuning knob, not a validated default
+
+Both launchers hardcode `-b 8192 -ub 8192`. Unlike the KV/context knobs above, the batch sizes are not
+exposed as environment variables: to change them, edit the `ARGS` line in `strix.bat` (or the
+`addLine` call in `strix_gui.cpp` and rebuild).
+
+They are the knob to reach for when the memory arithmetic above does not fit: `-ub` sets the size of
+the dense activation tensors, so it drives prefill peak memory roughly in proportion, and it is the
+first thing to lower if a deep-context load fails to commit. The trade goes both ways - a larger
+`-ub` means fewer, wider GEMMs, which can be more efficient on some weight layouts and less on others.
+
+**8192 is the validated launch configuration; nothing else has been validated that way.** Batch size
+is not a free knob, because it changes the order in which reductions accumulate: a different `-ub`
+can produce different generated text at the same temperature, which is exactly why the perplexity
+gate for this package deliberately runs a much smaller fixed batch (`-b 512 -ub 4`) to get a
+reproducible number. So treat any other value as an experiment rather than a tuning result: confirm
+the model still loads, and do not read a speed difference as a win until output still looks right.
+No alternative batch size has been measured as a shipping launch configuration for this package.
+
 ## Vision / image input
 On by default: the shipping command line passes `--mmproj-auto`, so the server resolves and
 downloads the repo's projector and image input is available out of the box. The vision tower needs

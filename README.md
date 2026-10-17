@@ -29,7 +29,7 @@ this is assembled from several sources and each is credited there.
 The fastest path is the release archive — a self-contained Windows runtime, no build tools
 needed (only the installed AMD graphics driver):
 
-1. Download `franken-llama-0.3.1.zip` from the [latest release](../../releases).
+1. Download `franken-llama-0.3.2.zip` from the [latest release](../../releases).
 2. Unzip anywhere.
 3. Double-click `launcher\strix.bat`.
 

@@ -22,6 +22,7 @@
 #include <shellapi.h>
 #include <string>
 #include <vector>
+#include <map>
 #include <thread>
 #include <atomic>
 #include <cwctype>
@@ -391,6 +392,17 @@ static std::wstring fmtInt(double v, bool has) {
     if (!has) return L"-";
     wchar_t b[64]; _snwprintf(b, 64, L"%.0f", v); return b;
 }
+// Live per-request throughput, derived the same way the WebUI gets its smooth numbers -- from the
+// counters of the request in flight rather than from a server-wide gauge. /slots exposes, per slot,
+// n_prompt_tokens_processed and next_token[].n_decoded, both of which climb for the duration of the
+// current task, so the difference between two polls divided by the real elapsed time is a genuine
+// instantaneous rate. The task id (id_task) is tracked so a new request re-baselines instead of
+// producing a huge negative delta, and only slots that are actually processing contribute.
+struct SlotBase { double idTask = -1; double promptProc = 0; double decoded = 0; };
+static std::map<int, SlotBase> g_slotBase;
+static ULONGLONG g_slotsTick = 0;
+static void resetSlotRates() { g_slotBase.clear(); g_slotsTick = 0; }
+
 // One poll cycle: hit /health, and if up, /props + /metrics + /slots, and build the status text.
 // Shared by the GUI worker thread and the headless --smoke test so both exercise the same parse.
 static Status pollOnce(HINTERNET s) {
@@ -425,6 +437,52 @@ static Status pollOnce(HINTERNET s) {
         long long sec = (long long)((GetTickCount64() - g_launchTick) / 1000);
         up = fmt(L"%lldm%02llds", sec / 60, sec % 60);
     }
+    // /slots is fetched before the perf line because the live rates below are derived from it.
+    struct SlotRow { double id, pt, dec; bool proc, spec; };
+    std::vector<SlotRow> rows;
+    double livePp = -1, liveTg = -1;
+    if (slotsOn && httpGet(s, g_ssl, (INTERNET_PORT)g_port, L"/slots", slots)) {
+        auto objs = jsonObjects(slots);
+        double sumPrompt = 0, sumDecoded = 0;
+        bool anyProcessing = false;
+        std::map<int, SlotBase> next;
+        for (size_t i = 0; i < objs.size(); i++) {
+            const std::string& e = objs[i]; double id = 0, pt = 0, dec = 0, idTask = -1;
+            bool proc = false, spec = false;
+            jNum(e, "id", id); jBool(e, "is_processing", proc); jBool(e, "speculative", spec);
+            jNum(e, "n_prompt_tokens", pt);
+            jNum(e, "id_task", idTask);
+            double pp = 0; jNum(e, "n_prompt_tokens_processed", pp);
+            size_t nt = e.find("\"next_token\"");
+            if (nt != std::string::npos) jNum(e, "n_decoded", dec, nt);
+            rows.push_back({ id, pt, dec, proc, spec });
+            int key = (int)id;
+            next[key] = SlotBase{ idTask, pp, dec };
+            if (proc) {
+                anyProcessing = true;
+                auto it = g_slotBase.find(key);
+                // only compare against a baseline from the SAME task; a finished or new task restarts
+                if (it != g_slotBase.end() && it->second.idTask == idTask && g_slotsTick) {
+                    double dt = (GetTickCount64() - g_slotsTick) / 1000.0;
+                    if (dt > 0.05) {
+                        double dPrompt = pp - it->second.promptProc;
+                        double dDec    = dec - it->second.decoded;
+                        if (dPrompt > 0) sumPrompt += dPrompt;
+                        if (dDec    > 0) sumDecoded += dDec;
+                    }
+                }
+            }
+        }
+        double dt = g_slotsTick ? (GetTickCount64() - g_slotsTick) / 1000.0 : 0.0;
+        if (anyProcessing && dt > 0.05) {
+            if (sumPrompt  > 0) livePp = sumPrompt  / dt;
+            if (sumDecoded > 0) liveTg = sumDecoded / dt;
+        }
+        g_slotBase.swap(next);
+        g_slotsTick = GetTickCount64();
+    } else {
+        resetSlotRates();
+    }
     std::wstring text;
     text += fmt(L"model : %s  [%s]   ctx=%s  slots=%s\r\n", model.c_str(), ftype.c_str(), nctx.c_str(), nslots.c_str());
     text += fmt(L"state : %s   vision=%s   uptime=%s   build=%s\r\n",
@@ -433,17 +491,18 @@ static Status pollOnce(HINTERNET s) {
         Metrics x = parseMetrics(metrics);
         std::wstring acc = L"-";
         if (x.draft > 0) { wchar_t b[32]; _snwprintf(b, 32, L"%.1f%%", 100.0 * x.accepted / x.draft); acc = b; }
-        // prompt_tokens_seconds / predicted_tokens_seconds are gauges averaged over the window
-        // BETWEEN two scrapes, and the server resets the bucket on every scrape (see the comment in
-        // server-context.cpp use_cached_metrics). A prefill is a sub-second burst, so it usually
-        // lands in no poll window at all and the gauge reads 0 -- which is why prefill looked dead.
-        // The cumulative counters are never reset, so tokens_total / seconds_total is the real
-        // busy-time throughput and is non-zero as soon as any work has run. Use the live gauge when
-        // it has one, else fall back to the lifetime average and mark it.
+        // The *_seconds gauges are averaged over the window BETWEEN two scrapes and the server resets
+        // the bucket on every scrape (server-context.cpp use_cached_metrics), so a burst that misses
+        // the window reads 0. The cumulative counters are never reset, so tokens_total/seconds_total
+        // is a true busy-time average -- but it is a LIFETIME average, not a live rate.
+        // Priority: live rate measured from this request's own slot counters, else the per-scrape
+        // gauge if it happened to be non-zero, else the lifetime average tagged " (avg)".
         double cumPp = (x.prompt_secs > 0) ? x.prompt_total / x.prompt_secs : -1;
         double cumTg = (x.predict_secs > 0) ? x.predict_total / x.predict_secs : -1;
-        bool ppLive = x.has_pp && x.pp > 0, tgLive = x.has_tg && x.tg > 0;
-        double pp = ppLive ? x.pp : cumPp, tg = tgLive ? x.tg : cumTg;
+        bool ppLive = livePp >= 0 || (x.has_pp && x.pp > 0);
+        bool tgLive = liveTg >= 0 || (x.has_tg && x.tg > 0);
+        double pp = livePp >= 0 ? livePp : ((x.has_pp && x.pp > 0) ? x.pp : cumPp);
+        double tg = liveTg >= 0 ? liveTg : ((x.has_tg && x.tg > 0) ? x.tg : cumTg);
         // NOTE the L"" on both arms: a narrow " (avg)" here would be passed as char* to a wide %s,
         // which reinterprets the bytes as UTF-16 and prints mojibake in place of the marker.
         text += fmt(L"perf  : prefill %s%s t/s   decode %s%s t/s   spec accept %s\r\n",
@@ -457,19 +516,13 @@ static Status pollOnce(HINTERNET s) {
     } else {
         text += L"perf  : metrics endpoint not enabled\r\n";
     }
-    if (slotsOn && httpGet(s, g_ssl, (INTERNET_PORT)g_port, L"/slots", slots)) {
+    if (!rows.empty()) {
         std::wstring line = L"slots : ";
-        auto objs = jsonObjects(slots);
-        for (size_t i = 0; i < objs.size(); i++) {
-            const std::string& e = objs[i]; double id = 0, pt = 0, dec = 0;
-            bool proc = false, spec = false;
-            jNum(e, "id", id); jBool(e, "is_processing", proc); jBool(e, "speculative", spec);
-            jNum(e, "n_prompt_tokens", pt);
-            size_t nt = e.find("\"next_token\"");
-            if (nt != std::string::npos) jNum(e, "n_decoded", dec, nt);
+        for (size_t i = 0; i < rows.size(); i++) {
+            const SlotRow& r = rows[i];
             wchar_t b[160];
             _snwprintf(b, 160, L"%sslot %.0f: %s %s  prompt=%.0f gen=%.0f",
-                       i ? L" | " : L"", id, proc ? L"busy" : L"idle", spec ? L"spec" : L"no-spec", pt, dec);
+                       i ? L" | " : L"", r.id, r.proc ? L"busy" : L"idle", r.spec ? L"spec" : L"no-spec", r.pt, r.dec);
             line += b;
         }
         text += line;
@@ -493,11 +546,14 @@ static void worker() {
         }
         Status* st = new Status(pollOnce(s));
         postStatus(st);
-        for (int i = 0; i < 20 && g_poll.load(); i++) Sleep(100);
+        // 1s, matching --watch (the configuration the live-rate deltas were validated under). A
+        // slower poll widens the window a short prefill must fit inside to register, and the GUI
+        // feels noticeably lumpier; /slots + /metrics on loopback are cheap enough not to matter.
+        for (int i = 0; i < 10 && g_poll.load(); i++) Sleep(100);
     }
     if (s) WinHttpCloseHandle(s);
 }
-static void startWorker() { if (!g_worker.joinable()) { g_poll = true; g_worker = std::thread(worker); } }
+static void startWorker() { if (!g_worker.joinable()) { resetSlotRates(); g_poll = true; g_worker = std::thread(worker); } }
 static void stopWorker() { g_poll = false; if (g_worker.joinable()) g_worker.join(); }
 
 // ------------------------------------------------------------------ UI state helpers
@@ -800,6 +856,39 @@ static int runStatus() {
     if (s) WinHttpCloseHandle(s);
     return st.ok ? 0 : 1;
 }
+static int runWatch(int seconds) {
+    HINTERNET s = WinHttpOpen(L"StrixLauncher/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                              WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    WinHttpSetTimeouts(s, 1500, 1500, 2000, 2000);
+    g_pid = findServerPid(g_port);
+    g_adopted = g_pid != 0;
+    printf("watching port %d (pid %lu) for %ds, 1s polls. Ctrl+C to stop.\n", g_port, g_pid, seconds);
+    ULONGLONG end = GetTickCount64() + (ULONGLONG)seconds * 1000;
+    int rc = 1;
+    while (GetTickCount64() < end) {
+        Status st = pollOnce(s);
+        if (st.ok) {
+            rc = 0;
+            // print one compact line per poll so a live rate is visible as it changes
+            std::string one = wtou8(st.stat);
+            std::string perf = "?";
+            size_t pp = one.find("perf  : ");
+            if (pp != std::string::npos) { size_t e = one.find("\r\n", pp); perf = one.substr(pp + 8, e - pp - 8); }
+            // print the per-slot line too: without it a "live" decode reading cannot be told apart
+            // from a stale counter on an idle slot -- the processing flags are the proof.
+            std::string slotline = "";
+            size_t sp = one.find("slots : ");
+            if (sp != std::string::npos) { size_t e = one.find("\r\n", sp); slotline = " | " + one.substr(sp, e - sp); }
+            printf("[%5.1fs] %s%s\n", (seconds*1000.0 - (end - GetTickCount64())) / 1000.0, perf.c_str(), slotline.c_str());
+        } else {
+            printf("[%5.1fs] not ready\n", (seconds*1000.0 - (end - GetTickCount64())) / 1000.0);
+        }
+        fflush(stdout);
+        for (int i = 0; i < 10; i++) Sleep(100);
+    }
+    if (s) WinHttpCloseHandle(s);
+    return rc;
+}
 static int runSmoke() {
     // refuse rather than stack a second server on a live one (and on UMA, OOM trying)
     DWORD busy = findServerPid(g_port);
@@ -855,7 +944,15 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdLine, int show) {
         bool selftest = wcsstr(cmdLine, L"--selftest") != nullptr;
         bool smoke = wcsstr(cmdLine, L"--smoke") != nullptr;
         bool status = wcsstr(cmdLine, L"--status") != nullptr;
-        if (selftest || smoke || status) {
+        bool watch = wcsstr(cmdLine, L"--watch") != nullptr;
+        // --port N lets the headless modes point at a non-default server (e.g. a quiet test instance)
+        // instead of always hitting 9931, which is the only thing that can make an idle control idle.
+        {
+            const wchar_t* flag = L"--port ";
+            const wchar_t* pp = wcsstr(cmdLine, flag);
+            if (pp) { int v = _wtoi(pp + 7); if (v > 0 && v < 65536) g_port = v; }
+        }
+        if (selftest || smoke || status || watch) {
             // A GUI-subsystem exe has no console. When launched from a shell, stdout is already
             // inherited (a pipe/file) and printf just works. Only when stdout is a console or
             // absent do we need to attach the parent console -- and we must NOT freopen over a
@@ -869,7 +966,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdLine, int show) {
                     freopen("CONOUT$", "w", stderr);
                 }
             }
-            int rc = selftest ? runSelftest() : (status ? runStatus() : runSmoke());
+            int rc = selftest ? runSelftest() : (status ? runStatus() : (watch ? runWatch(25) : runSmoke()));
             DeleteCriticalSection(&g_cs);
             return rc;
         }

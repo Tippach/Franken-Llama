@@ -103,6 +103,34 @@ static bool strixllama_env_is_gate(const char * kv) {
         || _strnicmp(kv, "STRIX_", 6) == 0;
 }
 
+// STRIXLLAMA_* is the DEV/TEST namespace: it is deliberately NOT wiped, so test hooks
+// (STRIXLLAMA_LB_FAULT, _KB_FAULT, _DT_SYNC, _KB_DBG, ...) and the A/B harnesses that toggle a
+// gate through the environment survive the bake. The cost is that a couple of DEFAULT-ON SHIPPING
+// gates also live in this namespace and are therefore NOT re-asserted by the binary -- the
+// launcher never sets them, so any value present at a BAKED launch came from the parent shell and
+// silently changes behaviour (a leaked STRIXLLAMA_DRAFT_LEN=0 from a dev session disables a
+// default-ON +8.9%-CJK feature in production, unfalsifiable from the log). We cannot bake or wipe
+// these names without breaking the harnesses that toggle them via env (STRIX_ENV_BAKE stays ON for
+// the 39 canonical gates those harnesses rely on), so instead we make a leak LOUD: the banner
+// names any of these that is present. Add a name here when a new default-ON gate is put in the
+// STRIXLLAMA_ namespace.
+static const char * const g_strixllama_leak_watch[] = {
+    "STRIXLLAMA_DRAFT_LEN",   // draft-length controller: unset = ON, 0 = OFF (fixed --spec-draft-n-max)
+    "STRIXLLAMA_KB_RESTORE",  // block-key-cache restore: unset = ON, 0 = OFF
+};
+static const size_t n_leak_watch = sizeof(g_strixllama_leak_watch) / sizeof(g_strixllama_leak_watch[0]);
+
+// case-insensitive compare of the NAME part (before '=') of an "NAME=value" env entry against a
+// bare NAME.
+static bool strixllama_env_name_eq(const char * kv, const char * name) {
+    size_t nlen = strlen(name);
+    const char * eq = strchr(kv, '=');
+    if (!eq || (size_t) (eq - kv) != nlen) {
+        return false;
+    }
+    return _strnicmp(kv, name, nlen) == 0;
+}
+
 static void strixllama_bake_env(void) {
     static const size_t n_gates = sizeof(g_strixllama_env_gates) / sizeof(g_strixllama_env_gates[0]);
 
@@ -123,10 +151,21 @@ static void strixllama_bake_env(void) {
 
     size_t n    = 0;
     size_t drop = 0;
+    // inherited STRIXLLAMA_* vars are carried over verbatim (the dev/test namespace is not owned).
+    // flag the ones that are actually default-ON shipping gates so a leaked control value in a
+    // production launch is visible rather than silently reconfiguring the server.
+    const char * leaks[8];
+    size_t       n_leaks = 0;
     for (size_t i = 0; i < n_in; i++) {
         if (strixllama_env_is_gate(_environ[i])) {
             drop++;
             continue;
+        }
+        for (size_t w = 0; w < n_leak_watch; w++) {
+            if (strixllama_env_name_eq(_environ[i], g_strixllama_leak_watch[w]) && n_leaks < sizeof(leaks) / sizeof(leaks[0])) {
+                leaks[n_leaks++] = _environ[i];
+                break;
+            }
         }
         if (char * dup = _strdup(_environ[i])) {
             table[n++] = dup;
@@ -148,6 +187,18 @@ static void strixllama_bake_env(void) {
     if (drop > 0 || (mode && atoi(mode) >= 2)) {
         fprintf(stderr, "strixllama: environment baked, %zu gates set, %zu inherited gate vars dropped\n",
                 n_gates, drop);
+        fflush(stderr);
+    }
+    // Printed regardless of drop: a leaked shipping gate is exactly the case that needs to be loud,
+    // and in a clean production launch drop is usually 0 so the banner above never fires.
+    if (n_leaks > 0) {
+        fprintf(stderr, "strixllama: WARNING %zu shipping gate(s) set in the STRIXLLAMA_ pass-through "
+                        "namespace (NOT owned by the bake, left in effect):\n", n_leaks);
+        for (size_t i = 0; i < n_leaks; i++) {
+            fprintf(stderr, "strixllama:   %s\n", leaks[i]);
+        }
+        fprintf(stderr, "strixllama: if this is a production launch, unset them -- the launcher does "
+                        "not set these, so they came from the parent environment.\n");
         fflush(stderr);
     }
 }
