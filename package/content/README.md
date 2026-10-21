@@ -208,6 +208,21 @@ It offers a **checkpoint dropdown**, checkboxes for the quick-access knobs (visi
 MTP speculative decode, the Latin draft trim, YaRN, HTTPS), a context-size and slot picker, and the
 prompt-cache mode. **Launch** starts the server with no console window; **Stop** shuts it down.
 
+The dropdown offers four checkpoints: `UD-IQ4_XS` (the shipping default, and the one every number in
+this README was measured on), `ISTA IQ3_S` (per-tensor mixed precision, smaller), `Swift 1.5 IQ4_XS`
+(an agent/reasoning fine-tune of the same base by a different quantizer, and the largest at about 98 GB
+across its three shards) and `Huihui IQ4_XS` (an abliterated, refusal-disabled re-quant of the same
+UD-IQ4_XS base — same quant, same size class). All four are the same architecture and share the same MTP
+draft head. The launcher resolves and downloads whichever checkpoint you pick on first launch, so the
+first start of a new one is a large download.
+
+**`UD-IQ4_XS`, `ISTA IQ3_S` and `Huihui IQ4_XS` run with the packaged chat template**, not the one
+embedded in their own file: the launcher passes `--chat-template-file launcher\chat_template.jinja` for
+them. **`Swift 1.5 IQ4_XS` runs with its own embedded template** — it is a fine-tune whose template
+differs from the base model's, so the launcher leaves it unmodified (no `--chat-template-file`). For any
+checkpoint you can override the packaged template by setting `CTPL` to your own file, or set `CTPL=`
+(empty) to force the model-embedded template for the others as well.
+
 **Serving** defaults to *This computer only* (`127.0.0.1`). *All interfaces* (`0.0.0.0`) publishes the
 endpoint to the local network. An **API key** is optional: set one and clients must send
 `Authorization: Bearer <key>`; leave it blank and the launcher warns that the port is open to your LAN

@@ -43,11 +43,34 @@
     "processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
 // ------------------------------------------------------------------ model list
-struct Model { const wchar_t* label; const wchar_t* repo; const wchar_t* draft; const wchar_t* draftFile; };
+// embeddedTpl: when true the launcher does NOT force the packaged chat_template.jinja on this
+// checkpoint; it launches with an empty CTPL so the server uses the template embedded in the
+// model's own GGUF (the same result as clearing CTPL in strix.bat). --jinja is already the server
+// default, so no template flag is emitted on this path.
+struct Model { const wchar_t* label; const wchar_t* repo; const wchar_t* draft; const wchar_t* draftFile;
+               bool embeddedTpl = false; };
 static const Model MODELS[] = {
     { L"UD-IQ4_XS  (shipping default)", L"unsloth/Qwen3.8-Flash-Next-GGUF:UD-IQ4_XS",
       L"unsloth/Qwen3.8-Flash-Next-GGUF", L"MTP/mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf" },
     { L"ISTA IQ3_S  (GSQ-RCO)", L"ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF:IQ3_S",
+      L"unsloth/Qwen3.8-Flash-Next-GGUF", L"MTP/mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf" },
+    // Agent/reasoning fine-tune of the same base, from a different quantizer. Verified from the GGUF
+    // headers of all three checkpoints (no model load): identical tensor-name set and dims (1224 each),
+    // identical vocab (248320 tokens, bos 248044 / eos 248046, tokenizer pre "qwen35") and identical
+    // PLE n-gram geometry -- which is what makes the shared MTP head below loadable. Its dtype set is a
+    // subset of what UD and ISTA already ship, and the one header key it adds
+    // (qwen4exp.attention.recurrent_layers) equals the pattern the loader derives when that key is
+    // absent, so no hparam changes and no kernel path runs that is not already exercised.
+    // Its embedded chat template is kept (embeddedTpl=true): the packaged template matches none of
+    // the three models byte-for-byte, and this fine-tune ships its own, so it runs unmodified.
+    { L"Swift 1.5 IQ4_XS  (agent FT)", L"ukisai/Swift-1.5-Qwen3.8-Flash-Next-GGUF:IQ4_XS",
+      L"unsloth/Qwen3.8-Flash-Next-GGUF", L"MTP/mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf", true },
+    // Abliterated (refusal-disabled) re-quant of the same UD-IQ4_XS base already shipped above, by
+    // huihui-ai. Same arch, same quant, so it uses the packaged chat template and the shared MTP draft
+    // exactly like the UD entry. The repo nests the quant under an "unsloth-UD-IQ4_XS" subdir, but the
+    // :UD-IQ4_XS tag still resolves (the matcher regexes "UD-IQ4_XS[.-]" against the shard paths) and
+    // the root base mmproj is picked over the repo's Swift mmproj (find_best_sibling, verified).
+    { L"Huihui IQ4_XS  (abliterated)", L"huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-v2-GGUF:UD-IQ4_XS",
       L"unsloth/Qwen3.8-Flash-Next-GGUF", L"MTP/mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf" },
 };
 static const int N_MODELS = (int)(sizeof(MODELS) / sizeof(MODELS[0]));
@@ -438,7 +461,9 @@ static Status pollOnce(HINTERNET s) {
         up = fmt(L"%lldm%02llds", sec / 60, sec % 60);
     }
     // /slots is fetched before the perf line because the live rates below are derived from it.
-    struct SlotRow { double id, pt, dec; bool proc, spec; };
+    // ratePp/rateTg are this slot's own instantaneous t/s over the last poll interval (-1 = no
+    // fresh same-task delta); pt/dec stay the cumulative per-task counters.
+    struct SlotRow { double id, pt, dec, ratePp, rateTg; bool proc, spec; };
     std::vector<SlotRow> rows;
     double livePp = -1, liveTg = -1;
     if (slotsOn && httpGet(s, g_ssl, (INTERNET_PORT)g_port, L"/slots", slots)) {
@@ -446,6 +471,8 @@ static Status pollOnce(HINTERNET s) {
         double sumPrompt = 0, sumDecoded = 0;
         bool anyProcessing = false;
         std::map<int, SlotBase> next;
+        // elapsed since the previous poll; computed once so every slot's rate uses the same window.
+        double dt = g_slotsTick ? (GetTickCount64() - g_slotsTick) / 1000.0 : 0.0;
         for (size_t i = 0; i < objs.size(); i++) {
             const std::string& e = objs[i]; double id = 0, pt = 0, dec = 0, idTask = -1;
             bool proc = false, spec = false;
@@ -455,25 +482,23 @@ static Status pollOnce(HINTERNET s) {
             double pp = 0; jNum(e, "n_prompt_tokens_processed", pp);
             size_t nt = e.find("\"next_token\"");
             if (nt != std::string::npos) jNum(e, "n_decoded", dec, nt);
-            rows.push_back({ id, pt, dec, proc, spec });
+            double rPp = -1, rTg = -1;
             int key = (int)id;
             next[key] = SlotBase{ idTask, pp, dec };
             if (proc) {
                 anyProcessing = true;
                 auto it = g_slotBase.find(key);
                 // only compare against a baseline from the SAME task; a finished or new task restarts
-                if (it != g_slotBase.end() && it->second.idTask == idTask && g_slotsTick) {
-                    double dt = (GetTickCount64() - g_slotsTick) / 1000.0;
-                    if (dt > 0.05) {
-                        double dPrompt = pp - it->second.promptProc;
-                        double dDec    = dec - it->second.decoded;
-                        if (dPrompt > 0) sumPrompt += dPrompt;
-                        if (dDec    > 0) sumDecoded += dDec;
-                    }
+                if (it != g_slotBase.end() && it->second.idTask == idTask && g_slotsTick && dt > 0.05) {
+                    double dPrompt = pp - it->second.promptProc;
+                    double dDec    = dec - it->second.decoded;
+                    // per-slot rate: this slot's own tokens over the interval.
+                    if (dPrompt > 0) { sumPrompt += dPrompt; rPp = dPrompt / dt; }
+                    if (dDec    > 0) { sumDecoded += dDec;   rTg = dDec / dt; }
                 }
             }
+            rows.push_back({ id, pt, dec, rPp, rTg, proc, spec });
         }
-        double dt = g_slotsTick ? (GetTickCount64() - g_slotsTick) / 1000.0 : 0.0;
         if (anyProcessing && dt > 0.05) {
             if (sumPrompt  > 0) livePp = sumPrompt  / dt;
             if (sumDecoded > 0) liveTg = sumDecoded / dt;
@@ -524,6 +549,14 @@ static Status pollOnce(HINTERNET s) {
             _snwprintf(b, 160, L"%sslot %.0f: %s %s  prompt=%.0f gen=%.0f",
                        i ? L" | " : L"", r.id, r.proc ? L"busy" : L"idle", r.spec ? L"spec" : L"no-spec", r.pt, r.dec);
             line += b;
+            // per-slot live throughput, only when this slot has a fresh same-task delta.
+            if (r.ratePp >= 0 || r.rateTg >= 0) {
+                wchar_t pb[24], db[24], rb[64];
+                if (r.ratePp >= 0) _snwprintf(pb, 24, L"%.0f", r.ratePp); else wcscpy_s(pb, L"-");
+                if (r.rateTg >= 0) _snwprintf(db, 24, L"%.0f", r.rateTg); else wcscpy_s(db, L"-");
+                _snwprintf(rb, 64, L" [%ls/%ls t/s]", pb, db);
+                line += rb;
+            }
         }
         text += line;
     }
@@ -627,8 +660,10 @@ static Opts gatherOpts() {
     o.cache = comboSel(g_hCache); if (o.cache < 0) o.cache = 0;
     o.port = g_port;
     o.cacheDir = dirJoin(g_here, L"prompt-cache");
+    // A checkpoint marked embeddedTpl runs with its own GGUF template: leave o.tmpl empty so
+    // buildArgs skips --chat-template-file entirely (the empty-CTPL path in strix.bat).
     std::wstring tmpl = dirJoin(g_here, L"chat_template.jinja");
-    if (fileExists(tmpl)) o.tmpl = tmpl;
+    if (fileExists(tmpl) && !MODELS[o.model].embeddedTpl) o.tmpl = tmpl;
     o.sslKey = dirJoin(g_here, L"key.pem");
     o.sslCert = dirJoin(g_here, L"cert.pem");
     return o;
@@ -826,12 +861,30 @@ static bool resolveRuntime() {
 static int runSelftest() {
     for (int i = 0; i < N_MODELS; i++) {
         Opts o; o.model = i; o.cacheDir = dirJoin(g_here, L"prompt-cache");
+        // mirror gatherOpts(): packaged template unless the checkpoint opts into its embedded one
+        std::wstring tp = dirJoin(g_here, L"chat_template.jinja");
+        if (!MODELS[i].embeddedTpl) o.tmpl = tp;
         std::wstring args, err;
         printf("=== %s ===\n", wtou8(MODELS[i].label).c_str());
         if (buildArgs(o, args, err)) printf("%s\n\n", wtou8(args).c_str());
         else printf("ERROR: %s\n\n", wtou8(err).c_str());
     }
     printf("runtime: %s\n", wtou8(g_exe).c_str());
+    // template policy: a checkpoint flagged embeddedTpl must launch with no --chat-template-file;
+    // the others must carry the packaged one. Prove both directions here so a regression in the
+    // gatherOpts()/buildArgs() template gate is caught without a live server.
+    int tplOk = 1;
+    for (int i = 0; i < N_MODELS; i++) {
+        Opts o; o.model = i; o.cacheDir = dirJoin(g_here, L"prompt-cache");
+        std::wstring tp = dirJoin(g_here, L"chat_template.jinja");
+        if (!MODELS[i].embeddedTpl) o.tmpl = tp;
+        std::wstring a, e; bool built = buildArgs(o, a, e);
+        bool has = built && a.find(L"--chat-template-file") != std::wstring::npos;
+        bool want = !MODELS[i].embeddedTpl;
+        if (has != want) tplOk = 0;
+    }
+    printf("template policy (embedded checkpoints omit --chat-template-file): %s\n",
+           tplOk ? "yes" : "NO (BUG)");
     // the API key is optional: 0.0.0.0 with no key must still build (and emit no --api-key), while a
     // provided key must be passed through.
     Opts net0; net0.model = 0; net0.loopback = false; net0.cacheDir = dirJoin(g_here, L"prompt-cache");
@@ -842,7 +895,7 @@ static int runSelftest() {
     bool okKey = buildArgs(net1, a3, e3) && a3.find(L"--api-key") != std::wstring::npos;
     printf("network no-key allowed: %s ; with-key passes --api-key: %s\n",
            okNoKey ? "yes" : "NO (BUG)", okKey ? "yes" : "NO (BUG)");
-    return (okNoKey && okKey) ? 0 : 2;
+    return (okNoKey && okKey && tplOk) ? 0 : 2;
 }
 static int runStatus() {
     HINTERNET s = WinHttpOpen(L"StrixLauncher/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
