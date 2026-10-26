@@ -742,7 +742,33 @@ void llama_memory_hybrid_idx::clear(bool data) {
 bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     // same order as llama_memory_hybrid::seq_rm: the recurrent cache can refuse, so try it first
     if (!hybrid_idx_no_recr(get_mem_recr()) && !get_mem_recr()->seq_rm(seq_id, p0, p1)) {
-        return false;
+        // strixllama: a tail-only kv-chain restore keeps the PREVIOUS turn's attention rows in RAM and reloads
+        // only the recurrent tail slice of the last matched chunk. If that blob carries a state position above
+        // the matched rung (the run saved its tail at the end of the answer, not at the chunk boundary), the
+        // fill loop's trim [rung, end) is a partial remove the recurrent cache cannot serve - its rollback is
+        // bounded by n_rs_seq / the last recorded batch. Upstream returns false there and the server's caller
+        // GGML_ABORTs ("failed to remove sequence %d with p0=%d, p1=%d", common_context_seq_rm). The delta-net
+        // cannot be rewound to the rung, but dropping the whole sequence is always consistent, and the server
+        // right after the remove detects the out-of-step cache and re-prefills the prompt from its start
+        // ("the cache is out of step with its tokens" in server-context.cpp). Measured on the deployed build:
+        // task 5528, restored 49152 cells tail-only, trim at p0=49152 aborted on the recurrent refusal.
+        // STRIXLLAMA_SEQ_RM_DROP=0 restores the historical behaviour (propagate the refusal -> abort). Not
+        // stripped by the server's env-bake (^STRIX_ does not match STRIXLLAMA_), so it works from a plain
+        // environment like STRIXLLAMA_KB_RESTORE above.
+        static const bool seq_rm_drop = !getenv("STRIXLLAMA_SEQ_RM_DROP") || atoi(getenv("STRIXLLAMA_SEQ_RM_DROP")) != 0;
+        if (seq_rm_drop && seq_id >= 0 && p0 > 0 && p1 < 0) {
+            LLAMA_LOG_WARN("%s: sequence %d cannot roll back to %d (recurrent tail too far ahead); dropping the sequence\n",
+                    __func__, seq_id, p0);
+            p0 = 0;
+            // redo the recurrent removal over the full range; this is the one case where it cannot refuse:
+            // it clears the sequence's rows entirely and resets its rollback index
+            if (!get_mem_recr()->seq_rm(seq_id, 0, -1)) {
+                return false;
+            }
+            // and the attention/indexer removal below completes the drop
+        } else {
+            return false;
+        }
     }
 
     // strixllama: only a request that drops every sequence is proof the image cells are gone. A whole-

@@ -289,6 +289,12 @@ corpus re-prefills once as conversations return. The server logs one line at sta
 happens (`root changed ... N cached chunk file(s) ... are now unreachable`). Budget for that one-time
 re-prefill before changing `KVQ8` on a warm box.
 
+**Long multi-turn continuations no longer crash the server.** When a conversation resumes from a chunk
+boundary that doesn't line up with where the previous answer stored its recurrent state, the cache can't
+roll that sequence back to the rung — the server now drops the sequence and re-prefills the prompt from
+its start (a one-time slowdown on that turn) instead of exiting. The log says `dropping the sequence`
+when this happens. To restore the old fail-fast behaviour, set `STRIXLLAMA_SEQ_RM_DROP=0`.
+
 ## Multiple slots (`PARALLEL`)
 The default `PARALLEL=2` serves two conversations at once. It **requires** a unified KV cache, which
 the launcher sets for you (`--kv-unified`); with a per-slot cache the dense attention mask returns and
