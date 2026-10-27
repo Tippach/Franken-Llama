@@ -85,9 +85,14 @@ static const char * const g_strixllama_env_gates[] = {
     // Decode-side sparse gather: at decode batch 1-4 gather the top_k cells instead of reading the
     // whole f16 KV dense. Halves the decode-vs-depth slope.
     "LLAMA_QSA_DECODE_GATHER=1",
-    // Multi-slot MTP verify graph reuse: keep one (result, scheduler) pair per verify shape so the
-    // ~8900-node target-verify graph builds once and reuses. @46k +15.6%, byte-identical at temp=0.
-    "STRIX_SPEC_REUSE_MULTI=1",
+    // NOT baked: STRIX_SPEC_REUSE_MULTI (multi-slot MTP verify graph reuse). It was validated as
+    // +15.6% on the pre-merge strix-exp engine, where the single gf_res_prev slot thrashed whenever
+    // the verify shape alternated. On the current engine upstream's single-slot reuse already keeps
+    // the verify graph warm (graphs reused = 100/100 with the gate OFF), so the per-shape
+    // (result,scheduler) parking is pure overhead: ~50 ms of scheduler copy-out/reset/alloc churn
+    // every spec pass. Measured on ISTA (Qwen3.8-Flash-Next IQ3_S, MTP draft-n-max 3): ON = 19.9
+    // t/s vs OFF = 51.3 t/s (2.6x slower with it on). Code default is OFF (byte-identical to
+    // single-slot), so the correct production config is simply to not set it. Do not re-add.
     // Cap the MTP draft ubatch so its buffers fit next to the target.
     "STRIX_SPEC_DRAFT_UBATCH=2048",
 };
