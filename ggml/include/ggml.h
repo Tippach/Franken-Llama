@@ -430,7 +430,46 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
-        GGML_TYPE_COUNT   = 43,
+        // 43 .. 255 are left to upstream
+        // strixllama: EXL3 (ExLlamaV3, MIT, turboderp), the ids of ranma.cpp (saturnsky, MIT) so that files are shared.
+        // Trellis weights: 256 + 16*codebook + code, codebook 0 = mul1, 1 = mcg, 2 = 3inst; code 0..7 = 1..8 bits,
+        // 8..10 = 1.5/2.5/3.5 bits (mul1 only). 304 .. 311: the row codec (mul1 ring rows of 160) of n-gram tables
+        GGML_TYPE_EXL3_M1  = 256,
+        GGML_TYPE_EXL3_M2  = 257,
+        GGML_TYPE_EXL3_M3  = 258,
+        GGML_TYPE_EXL3_M4  = 259,
+        GGML_TYPE_EXL3_M5  = 260,
+        GGML_TYPE_EXL3_M6  = 261,
+        GGML_TYPE_EXL3_M7  = 262,
+        GGML_TYPE_EXL3_M8  = 263,
+        GGML_TYPE_EXL3_M1H = 264,
+        GGML_TYPE_EXL3_M2H = 265,
+        GGML_TYPE_EXL3_M3H = 266,
+        GGML_TYPE_EXL3_G1  = 272,
+        GGML_TYPE_EXL3_G2  = 273,
+        GGML_TYPE_EXL3_G3  = 274,
+        GGML_TYPE_EXL3_G4  = 275,
+        GGML_TYPE_EXL3_G5  = 276,
+        GGML_TYPE_EXL3_G6  = 277,
+        GGML_TYPE_EXL3_G7  = 278,
+        GGML_TYPE_EXL3_G8  = 279,
+        GGML_TYPE_EXL3_T1  = 288,
+        GGML_TYPE_EXL3_T2  = 289,
+        GGML_TYPE_EXL3_T3  = 290,
+        GGML_TYPE_EXL3_T4  = 291,
+        GGML_TYPE_EXL3_T5  = 292,
+        GGML_TYPE_EXL3_T6  = 293,
+        GGML_TYPE_EXL3_T7  = 294,
+        GGML_TYPE_EXL3_T8  = 295,
+        GGML_TYPE_EXL3R_M1 = 304,
+        GGML_TYPE_EXL3R_M2 = 305,
+        GGML_TYPE_EXL3R_M3 = 306,
+        GGML_TYPE_EXL3R_M4 = 307,
+        GGML_TYPE_EXL3R_M5 = 308,
+        GGML_TYPE_EXL3R_M6 = 309,
+        GGML_TYPE_EXL3R_M7 = 310,
+        GGML_TYPE_EXL3R_M8 = 311,
+        GGML_TYPE_COUNT   = 312,
     };
 
     // [TAG_GGML_PREC]
@@ -585,6 +624,9 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_TOP_K_MASK,
+        GGML_OP_QSA_PACK,       // strixllama: a K or V cache in the packed f16 layout of the sparse attention kernel
+        GGML_OP_MUL_MAT_HAD,    // strixllama: a product between Hadamard rotations (EXL3 weights), ggml_mul_mat_had
 
         GGML_OP_UNARY,
 
@@ -776,6 +818,13 @@ extern "C" {
 
     GGML_API bool    ggml_is_quantized(enum ggml_type type);
 
+    // strixllama: EXL3 trellis weights have no row API (to_float is NULL): rows are stored in groups of 128
+    GGML_API bool    ggml_is_exl3(enum ggml_type type);
+    // decodes the raw codebook values of one 128-row group into dst[128][k]
+    GGML_API void    ggml_exl3_decode_group(enum ggml_type type, const void * group, int64_t k, ggml_fp16_t * dst);
+    // EXL3 row codec rows (n-gram embedding tables) decode alone with to_float; they are read with ggml_get_rows only
+    GGML_API bool    ggml_is_exl3_row(enum ggml_type type);
+
     // TODO: temporary until model loading of ggml examples is refactored
     GGML_API enum ggml_type ggml_ftype_to_ggml_type(enum ggml_ftype ftype);
 
@@ -925,6 +974,7 @@ extern "C" {
             enum   ggml_type      type);
 
     // dst[i0, i1, i2] = a[i0, i1, i2] + b[i0, ids[i1, i2]]
+    // an id of -1 adds nothing: dst[i0, i1, i2] = a[i0, i1, i2]
     GGML_API struct ggml_tensor * ggml_add_id(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
@@ -1497,11 +1547,49 @@ extern "C" {
             enum ggml_op_hint    hint);
 
     // indirect matrix multiplication
+    // an id of -1 skips the slot and zeroes the matching row of the result
+    //
+    // [TAG_MUL_MAT_ID_DUPLICATE_ID]
+    // note: this op has undefined behaviour if a given `a` is referenced more than once for a given `b`
+    //       (i.e. duplicate experts per token are not guaranteed to be supported in all backends)
+    // TODO: add backend support: https://github.com/ggml-org/llama.cpp/pull/29998#issuecomment-6153742533
     GGML_API struct ggml_tensor * ggml_mul_mat_id(
             struct ggml_context * ctx,
             struct ggml_tensor  * as,
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids);
+
+    // strixllama: matrix multiplication between Hadamard rotations: rot_out * H(a^T H(rot_in * b))
+    // H is the normalized Sylvester Hadamard over blocks of `had` (a power of 2, <= 512) along K and along N
+    // a: [K, N] or [K, N, E], any 128-row view of it; EXL3 types need had = 128 and cannot be used in ggml_mul_mat
+    // b: F32, as in ggml_mul_mat (ids == NULL) or ggml_mul_mat_id (ids: I32 [n_expert_used, n_tokens])
+    // rot_in: F16/F32 [K] or [K, E], rot_out: F16/F32 [N] or [N, E]; result: F32 as for ggml_mul_mat(_id)
+    // sources: a, b, ids (NULL without ids, the place of the ids of ggml_mul_mat_id), rot_in, rot_out
+    // (from ranma.cpp, MIT)
+    GGML_API struct ggml_tensor * ggml_mul_mat_had(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * rot_in,
+            struct ggml_tensor  * rot_out,
+            struct ggml_tensor  * ids,
+            int                   had);
+
+    // strixllama: per-expert widths. The E experts of an EXL3 product with ids are split into up to 3 classes, each a
+    // stacked weight of its own EXL3 type: a = class 0, w1 / w2 = classes 1 / 2 (w2 may be NULL), all [K, N, E_c];
+    // cmap: I32 [E], expert e -> (class << 24) | index in its class; rot_in / rot_out per global expert ([K, E] /
+    // [N, E]) or shared ([K] / [N]). Sources 5, 6, 7 = cmap, w1, w2; the others as ggml_mul_mat_had.
+    GGML_API struct ggml_tensor * ggml_mul_mat_had_classes(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * rot_in,
+            struct ggml_tensor  * rot_out,
+            struct ggml_tensor  * ids,
+            int                   had,
+            struct ggml_tensor  * cmap,
+            struct ggml_tensor  * w1,
+            struct ggml_tensor  * w2);
 
     // A: m columns, n rows,
     // B: p columns, n rows,
@@ -2668,6 +2756,7 @@ extern "C" {
     // the output packs the attention scores [S_v, H_v, n_tokens, n_seqs] followed by K state
     // snapshots, most-recent first (slot 0 = final state, slot s = state s tokens back). K == 1
     // keeps only the final state; when n_tokens < K only slots 0..n_tokens-1 are written.
+    // when n_tokens > K only slot 0 is guaranteed; backends may leave slots 1..K-1 unwritten.
     GGML_API struct ggml_tensor * ggml_gated_delta_net(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,
@@ -2754,11 +2843,21 @@ extern "C" {
             struct ggml_tensor  * x,
             struct ggml_tensor  * weights);
 
+    // hc_pre with a per-element gate (Qwen3.8-Flash-Next): gate [n_embd, hc, n_tokens]
+    //   result[i, t] = scale*sum_h x[i, h, t]*sigmoid(gate[i, h, t])
+    //
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_pre_gated(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * gate,
+            float                 scale);
+
     // hc_post: x [n_embd, n_tokens], residual [n_embd, hc, n_tokens],
     //          post [hc, n_tokens], comb [dst_hc, src_hc, n_tokens]
     //          -> [n_embd, hc, n_tokens]
     //   result[i, dst, t] = x[i, t]*post[dst, t]
     //                       + sum_src residual[i, src, t]*comb[dst, src, t]
+    //   comb == NULL uses the identity: result[i, dst, t] = x[i, t]*post[dst, t] + residual[i, dst, t]
     //
     GGML_API struct ggml_tensor * ggml_dsv4_hc_post(
             struct ggml_context * ctx,
@@ -2766,6 +2865,35 @@ extern "C" {
             struct ggml_tensor  * residual,
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
+
+    // top-k sparse attention mask: keep the mask cells of the live picks and the extra cells, set the rest to -inf
+    //
+    // mask:   [n_kv,    m1,  m2,  m3]  f16 or f32, broadcast to the rows of top_k
+    // top_k:  [n_top,   ne1, ne2, ne3] i32, picks of each row
+    // score:  [n_pick,  ne1, ne2, ne3] f32, can be NULL: a pick is live when its score is above -inf, else every pick is live
+    // blocks: [n_blk,   n_pick]        i32, can be NULL: the member cells of each pick, else a pick is a cell
+    // extra:  [n_extra, ne1, ne2, ne3] i32, can be NULL: cells of each row kept without a pick
+    // res:    [n_kv,    ne1, ne2, ne3] same type as mask
+    //
+    // res[c, i] = mask[c, i % m] when c is a cell of a live pick of row i or an extra cell of row i, else -inf
+    // picks and cells out of range are skipped
+    //
+    GGML_API struct ggml_tensor * ggml_top_k_mask(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * mask,
+            struct ggml_tensor  * top_k,
+            struct ggml_tensor  * score,
+            struct ggml_tensor  * blocks,
+            struct ggml_tensor  * extra);
+    // strixllama: a layer's K (values = false) or V (values = true) cache view [256, heads, n_kv] (F16, Q8_0 or Q5_1,
+    // quantized ones dequantized as get_rows does) written straight into the packed f16 layouts of qsa3:
+    //   keys   [16, 4, 16, heads * n_kv / 4]: (a, b, c, h * n_kv/4 + n) = K[dim 16c + a][cell 4n + b][head h]
+    //   values [4, 256, heads * n_kv / 4]:    (b, d, h * n_kv/4 + n)     = V[dim d][cell 4n + b][head h]
+    // the same bytes as cast(F16) -> permute -> cont -> reshape -> permute -> cont, without the intermediate tensors
+    GGML_API struct ggml_tensor * ggml_qsa_pack(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * cache,
+            bool                  values);
 
     // custom operators
 

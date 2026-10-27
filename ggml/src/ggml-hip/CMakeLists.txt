@@ -12,7 +12,7 @@ list(APPEND CMAKE_PREFIX_PATH  ${ROCM_PATH})
 list(APPEND CMAKE_PREFIX_PATH "${ROCM_PATH}/lib64/cmake")
 
 if (NOT DEFINED CMAKE_HIP_FLAGS_DEBUG)
-    set(CMAKE_HIP_FLAGS_DEBUG "-g -O2")
+    set(CMAKE_HIP_FLAGS_DEBUG "-g -Xarch_device -O2 -Xarch_host -O0")
 endif()
 
 # CMake on Windows doesn't support the HIP language yet
@@ -132,6 +132,11 @@ if (CXX_IS_HIPCC)
 else()
     set_source_files_properties(${GGML_SOURCES_ROCM} PROPERTIES LANGUAGE HIP)
 endif()
+
+# strixllama: mul-mat-had.cu without true16 code generation. With it, clang re-inserts the 16-bit halves of every WMMA
+# operand loaded from LDS (two VALU instructions per register, most of the VALU work of the GEMM loops)
+get_filename_component(GGML_HIP_MMH_SRC ../ggml-cuda/mul-mat-had.cu ABSOLUTE)
+set_property(SOURCE ${GGML_HIP_MMH_SRC} APPEND_STRING PROPERTY COMPILE_FLAGS " -Xclang -target-feature -Xclang -real-true16")
 
 if (GGML_STATIC)
     message(FATAL_ERROR "Static linking not supported for HIP/ROCm")

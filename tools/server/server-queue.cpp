@@ -489,6 +489,7 @@ server_task_result_ptr server_response::recv(const std::unordered_set<int> & id_
 }
 
 server_task_result_ptr server_response::recv_with_timeout(const std::unordered_set<int> & id_tasks, int timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout);
     while (true) {
         std::unique_lock<std::mutex> lock(mutex_results);
 
@@ -500,7 +501,7 @@ server_task_result_ptr server_response::recv_with_timeout(const std::unordered_s
             }
         }
 
-        std::cv_status cr_res = condition_results.wait_for(lock, std::chrono::seconds(timeout));
+        std::cv_status cr_res = condition_results.wait_until(lock, deadline);
         if (!running) {
             RES_DBG("%s : queue result stop\n", __func__);
             std::terminate(); // we cannot return here since the caller is HTTP code
@@ -558,23 +559,23 @@ void server_response_reader::post_task(server_task && task, bool front) {
     GGML_ASSERT(!task.is_parent() && "not supported, use post_tasks() instead");
     task.index = 0;
     id_tasks.insert(task.id);
-    states.push_back(task.create_state());
+    states.push_back(task.create_state());   // strixllama: with the task's resp_tools
     queue_results.add_waiting_task_id(task.id);
     queue_tasks.post(std::move(task), front);
 }
 
-void server_response_reader::post_tasks(std::vector<server_task> && tasks, bool front) {
+void server_response_reader::post_tasks(std::vector<server_task> && tasks, const common_chat_session & session, bool front) {
     GGML_ASSERT(id_tasks.empty() && "post_tasks() can only be called once per reader");
     id_tasks = server_task::get_list_id(tasks);
     states.reserve(tasks.size());
     size_t index = 0;
     for (auto & task : tasks) {
         task.index = index++;
-        states.push_back(task.create_state());
+        states.push_back(task.create_state(session));
         // for child tasks
         for (auto & child_task : task.child_tasks) {
             child_task.index = index++;
-            states.push_back(child_task.create_state());
+            states.push_back(child_task.create_state(session));
         }
     }
     GGML_ASSERT(states.size() == id_tasks.size());
@@ -670,7 +671,7 @@ void server_response_reader::stop() {
 // tools, the grammar - are written in full once per file as {"hash": h, "value": v} and afterwards as {"same_as": h},
 // so a long agent session costs its new content, not its whole history on every call, and every line can still be
 // rebuilt from its file. A file over STRIX_REQUEST_LOG_MAX_MB (default 1024) is closed and the next one is <file>.2,
-// <file>.3, ...: nothing is deleted or overwritten.
+// <file>.3, ...; with STRIX_REQUEST_LOG_KEEP=n only the newest n of them are kept (default: all).
 
 namespace {
 struct strix_request_log {
@@ -681,6 +682,7 @@ struct strix_request_log {
     size_t      bytes     = 0;
     size_t      max_bytes = (size_t) 1024 << 20;
     int         part      = 1;
+    int         keep      = 0;                      // files kept, 0 = all
     std::unordered_set<std::string> seen;   // hashes written in full in the current file
 
     strix_request_log() {
@@ -691,6 +693,10 @@ struct strix_request_log {
         const char * m = getenv("STRIX_REQUEST_LOG_MAX_MB");
         if (m && atoi(m) > 0) {
             max_bytes = (size_t) atoi(m) << 20;
+        }
+        const char * k = getenv("STRIX_REQUEST_LOG_KEEP");
+        if (k && atoi(k) > 0) {
+            keep = atoi(k);
         }
     }
 
@@ -757,6 +763,10 @@ struct strix_request_log {
             f = nullptr;
             seen.clear();
             path = base + "." + std::to_string(++part);
+            if (keep > 0 && part - keep >= 1) {
+                const int old = part - keep;
+                std::remove((old == 1 ? base : base + "." + std::to_string(old)).c_str());
+            }
         }
     }
 };

@@ -10,6 +10,7 @@
 
 // FIXME: required here for quantization functions
 #include "ggml-quants.h"
+#include "ggml-exl3.h"
 
 #ifdef GGML_USE_CPU_HBM
 #include <hbwmalloc.h>
@@ -329,6 +330,17 @@ void ggml_log_callback_default(enum ggml_log_level level, const char * text, voi
 #endif
 
 
+// the thread sanitizer does not intercept vm_allocate and vm_deallocate, so it produces false positives
+#if defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define GGML_TSAN_ENABLED 1
+#endif
+#else
+#if defined(__SANITIZE_THREAD__)
+#define GGML_TSAN_ENABLED 1
+#endif
+#endif
+
 void * ggml_aligned_malloc(size_t size) {
 #if defined(__s390x__)
     const int alignment = 256;
@@ -346,7 +358,7 @@ void * ggml_aligned_malloc(size_t size) {
     void * aligned_memory = NULL;
   #ifdef GGML_USE_CPU_HBM
     int result = hbw_posix_memalign(&aligned_memory, alignment, size);
-  #elif TARGET_OS_OSX
+  #elif TARGET_OS_OSX && !defined(GGML_TSAN_ENABLED)
     GGML_UNUSED(alignment);
     kern_return_t alloc_status = vm_allocate((vm_map_t) mach_task_self(), (vm_address_t *) &aligned_memory, size, VM_FLAGS_ANYWHERE);
     int result = EFAULT;
@@ -393,7 +405,7 @@ void ggml_aligned_free(void * ptr, size_t size) {
     if (ptr != NULL) {
         hbw_free(ptr);
     }
-#elif TARGET_OS_OSX
+#elif TARGET_OS_OSX && !defined(GGML_TSAN_ENABLED)
     if (ptr != NULL) {
         vm_deallocate((vm_map_t)mach_task_self(), (vm_address_t)ptr, size);
     }
@@ -943,6 +955,226 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .type_size                = 0,
         .is_quantized             = false,
     },
+    // strixllama: EXL3 trellis (ggml-exl3.c, ranma.cpp, MIT): a block is 128 weights of a row, but rows are only
+    // stored in groups of 128
+    [GGML_TYPE_EXL3_M1] = {
+        .type_name                = "exl3_m1",
+        .blck_size                = 128,
+        .type_size                = 16,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_M2] = {
+        .type_name                = "exl3_m2",
+        .blck_size                = 128,
+        .type_size                = 32,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_M3] = {
+        .type_name                = "exl3_m3",
+        .blck_size                = 128,
+        .type_size                = 48,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_M4] = {
+        .type_name                = "exl3_m4",
+        .blck_size                = 128,
+        .type_size                = 64,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_M5] = {
+        .type_name                = "exl3_m5",
+        .blck_size                = 128,
+        .type_size                = 80,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_M6] = {
+        .type_name                = "exl3_m6",
+        .blck_size                = 128,
+        .type_size                = 96,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_M7] = {
+        .type_name                = "exl3_m7",
+        .blck_size                = 128,
+        .type_size                = 112,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_M8] = {
+        .type_name                = "exl3_m8",
+        .blck_size                = 128,
+        .type_size                = 128,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_M1H] = {
+        .type_name                = "exl3_m1h",
+        .blck_size                = 128,
+        .type_size                = 24,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_M2H] = {
+        .type_name                = "exl3_m2h",
+        .blck_size                = 128,
+        .type_size                = 40,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_M3H] = {
+        .type_name                = "exl3_m3h",
+        .blck_size                = 128,
+        .type_size                = 56,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_G1] = {
+        .type_name                = "exl3_g1",
+        .blck_size                = 128,
+        .type_size                = 16,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_G2] = {
+        .type_name                = "exl3_g2",
+        .blck_size                = 128,
+        .type_size                = 32,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_G3] = {
+        .type_name                = "exl3_g3",
+        .blck_size                = 128,
+        .type_size                = 48,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_G4] = {
+        .type_name                = "exl3_g4",
+        .blck_size                = 128,
+        .type_size                = 64,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_G5] = {
+        .type_name                = "exl3_g5",
+        .blck_size                = 128,
+        .type_size                = 80,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_G6] = {
+        .type_name                = "exl3_g6",
+        .blck_size                = 128,
+        .type_size                = 96,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_G7] = {
+        .type_name                = "exl3_g7",
+        .blck_size                = 128,
+        .type_size                = 112,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_G8] = {
+        .type_name                = "exl3_g8",
+        .blck_size                = 128,
+        .type_size                = 128,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_T1] = {
+        .type_name                = "exl3_t1",
+        .blck_size                = 128,
+        .type_size                = 16,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_T2] = {
+        .type_name                = "exl3_t2",
+        .blck_size                = 128,
+        .type_size                = 32,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_T3] = {
+        .type_name                = "exl3_t3",
+        .blck_size                = 128,
+        .type_size                = 48,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_T4] = {
+        .type_name                = "exl3_t4",
+        .blck_size                = 128,
+        .type_size                = 64,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_T5] = {
+        .type_name                = "exl3_t5",
+        .blck_size                = 128,
+        .type_size                = 80,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_T6] = {
+        .type_name                = "exl3_t6",
+        .blck_size                = 128,
+        .type_size                = 96,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_T7] = {
+        .type_name                = "exl3_t7",
+        .blck_size                = 128,
+        .type_size                = 112,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_T8] = {
+        .type_name                = "exl3_t8",
+        .blck_size                = 128,
+        .type_size                = 128,
+        .is_quantized             = true,
+    },    // EXL3 row codec (ggml-exl3.c): a row of 160 is an fp16 scale and a ring of 160*bits bits
+    [GGML_TYPE_EXL3R_M1] = {
+        .type_name                = "exl3r_m1",
+        .blck_size                = 160,
+        .type_size                = 22,
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_exl3r_m1,
+    },
+    [GGML_TYPE_EXL3R_M2] = {
+        .type_name                = "exl3r_m2",
+        .blck_size                = 160,
+        .type_size                = 42,
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_exl3r_m2,
+    },
+    [GGML_TYPE_EXL3R_M3] = {
+        .type_name                = "exl3r_m3",
+        .blck_size                = 160,
+        .type_size                = 62,
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_exl3r_m3,
+    },
+    [GGML_TYPE_EXL3R_M4] = {
+        .type_name                = "exl3r_m4",
+        .blck_size                = 160,
+        .type_size                = 82,
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_exl3r_m4,
+    },
+    [GGML_TYPE_EXL3R_M5] = {
+        .type_name                = "exl3r_m5",
+        .blck_size                = 160,
+        .type_size                = 102,
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_exl3r_m5,
+    },
+    [GGML_TYPE_EXL3R_M6] = {
+        .type_name                = "exl3r_m6",
+        .blck_size                = 160,
+        .type_size                = 122,
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_exl3r_m6,
+    },
+    [GGML_TYPE_EXL3R_M7] = {
+        .type_name                = "exl3r_m7",
+        .blck_size                = 160,
+        .type_size                = 142,
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_exl3r_m7,
+    },
+    [GGML_TYPE_EXL3R_M8] = {
+        .type_name                = "exl3r_m8",
+        .blck_size                = 160,
+        .type_size                = 162,
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_exl3r_m8,
+    },
 };
 
 const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type type) {
@@ -1084,6 +1316,9 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_COMB",
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
+    "TOP_K_MASK",
+    "QSA_PACK",
+    "MUL_MAT_HAD",
 
     "UNARY",
 
@@ -1101,7 +1336,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1199,6 +1434,9 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_comb(mixes, scale, base)",
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
+    "top_k_mask(mask, top_k, score, blocks, extra)",
+    "qsa_pack(x)",
+    "mul_mat_had(a,b)",
 
     "unary(x)",
 
@@ -1216,7 +1454,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -1780,6 +2018,15 @@ static struct ggml_tensor * ggml_new_tensor_impl(
         view_src   = view_src->view_src;
     }
 
+    // validate number of elements to fit in int64_t
+    int64_t current_nelements = ne[0];
+    for (int i = 1; i < n_dims; i++) {
+        if (ne[i] > 1) {
+            GGML_ASSERT(INT64_MAX / ne[i] > current_nelements);
+            current_nelements *= ne[i];
+        }
+    }
+
     size_t data_size = ggml_row_size(type, ne[0]);
     for (int i = 1; i < n_dims; i++) {
         data_size *= ne[i];
@@ -2190,6 +2437,7 @@ static struct ggml_tensor * ggml_acc_impl(
 
     struct ggml_tensor * result = inplace ? ggml_view_tensor(ctx, a) : ggml_dup_tensor(ctx, a);
 
+    GGML_ASSERT(offset < (size_t)(1 << 30));
     int32_t params[] = { nb1, nb2, nb3, offset, inplace ? 1 : 0 };
     ggml_set_op_params(result, params, sizeof(params));
 
@@ -3312,6 +3560,7 @@ bool ggml_prec_set_src(
     switch (a->op) {
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
+        case GGML_OP_MUL_MAT_HAD:
             {
                 if (idx != 1) {
                     return false;
@@ -3344,6 +3593,8 @@ struct ggml_tensor * ggml_mul_mat(
         struct ggml_tensor  * b) {
     GGML_ASSERT(ggml_can_mul_mat(a, b));
     GGML_ASSERT(!ggml_is_transposed(a));
+    GGML_ASSERT(!ggml_is_exl3(a->type) && "EXL3 weights need ggml_mul_mat_had");
+    GGML_ASSERT(!ggml_is_exl3_row(a->type) && "EXL3 row codec tables are read with ggml_get_rows");
 
     const int64_t ne[4] = { a->ne[1], b->ne[1], b->ne[2], b->ne[3] };
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
@@ -3388,6 +3639,8 @@ void ggml_mul_mat_set_hint(
     in b, n_expert_used can be broadcasted to match the n_expert_used of ids
 
     c ~= as[:,:,i] @ b[:,i%r,t], i = ids[e,t] for all e,t in ids
+
+    an id of -1 skips the slot: no matrix is selected, c[:,e,t] is set to zero
 */
 struct ggml_tensor * ggml_mul_mat_id(
         struct ggml_context * ctx,
@@ -3396,6 +3649,8 @@ struct ggml_tensor * ggml_mul_mat_id(
         struct ggml_tensor  * ids) {
     GGML_ASSERT(!ggml_is_transposed(as));
     GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(!ggml_is_exl3(as->type) && "EXL3 weights need ggml_mul_mat_had");
+    GGML_ASSERT(!ggml_is_exl3_row(as->type) && "EXL3 row codec tables are read with ggml_get_rows");
 
     GGML_ASSERT(as->ne[3] == 1); // as is 3d (one matrix per expert)
     GGML_ASSERT(b->ne[3] == 1); // b is 3d
@@ -3412,6 +3667,108 @@ struct ggml_tensor * ggml_mul_mat_id(
     result->src[1] = b;
     result->src[2] = ids;
 
+    return result;
+}
+
+// ggml_mul_mat_had (strixllama: from ranma.cpp, MIT)
+
+// strixllama: [n, n_exp], or [n, 1]: one rotation shared by all weight matrices
+static bool ggml_mul_mat_had_rot(const struct ggml_tensor * rot, int64_t n, int64_t n_exp) {
+    return (rot->type == GGML_TYPE_F32 || rot->type == GGML_TYPE_F16) && rot->nb[0] == ggml_type_size(rot->type) &&
+        rot->ne[0] == n && (rot->ne[1] == n_exp || rot->ne[1] == 1) && rot->ne[2] == 1 && rot->ne[3] == 1;
+}
+
+// n_exp: the experts the rotations and ids index (a->ne[2], or the classes' total)
+static struct ggml_tensor * ggml_mul_mat_had_impl(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * rot_in,
+        struct ggml_tensor  * rot_out,
+        struct ggml_tensor  * ids,
+        int                   had,
+        int64_t               n_exp) {
+    const int64_t k     = a->ne[0];
+    const int64_t n     = a->ne[1];
+
+    GGML_ASSERT(had >= 2 && had <= 512 && (had & (had - 1)) == 0);
+    GGML_ASSERT(k % had == 0 && n % had == 0);
+    GGML_ASSERT(a->type == GGML_TYPE_F32 || a->type == GGML_TYPE_F16 || ggml_is_exl3(a->type));
+    GGML_ASSERT(a->ne[3] == 1 && a->nb[0] == ggml_type_size(a->type) && a->nb[1] == ggml_row_size(a->type, k) && a->nb[2] >= n*a->nb[1]);
+    if (ggml_is_exl3(a->type)) {
+        // rows are stored in groups of 128, and the group is the H128 output block
+        GGML_ASSERT(had == 128);
+        GGML_ASSERT(a->view_offs % (128*a->nb[1]) == 0 && a->nb[2] % (128*a->nb[1]) == 0);
+    }
+    GGML_ASSERT(b->type == GGML_TYPE_F32 && b->ne[0] == k);
+    GGML_ASSERT(ggml_mul_mat_had_rot(rot_in, k, n_exp) && ggml_mul_mat_had_rot(rot_out, n, n_exp));
+
+    int64_t ne[4] = { n, b->ne[1], b->ne[2], b->ne[3] };
+    if (ids) {
+        GGML_ASSERT(ids->type == GGML_TYPE_I32 && ids->ne[2] == 1 && ids->ne[3] == 1);
+        GGML_ASSERT(ids->ne[1] == b->ne[2] && b->ne[3] == 1);
+        GGML_ASSERT(ids->ne[0] % b->ne[1] == 0);
+        ne[1] = ids->ne[0];
+    } else {
+        GGML_ASSERT(b->ne[2] % n_exp == 0);
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    ggml_set_op_params_i32(result, 0, had);
+
+    // src[2] = ids as in ggml_mul_mat_id, so code that reads the expert ids of an op finds them in the same place
+    result->op     = GGML_OP_MUL_MAT_HAD;
+    result->src[0] = a;
+    result->src[1] = b;
+    result->src[2] = ids;
+    result->src[3] = rot_in;
+    result->src[4] = rot_out;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_mul_mat_had(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * rot_in,
+        struct ggml_tensor  * rot_out,
+        struct ggml_tensor  * ids,
+        int                   had) {
+    return ggml_mul_mat_had_impl(ctx, a, b, rot_in, rot_out, ids, had, a->ne[2]);
+}
+
+struct ggml_tensor * ggml_mul_mat_had_classes(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * rot_in,
+        struct ggml_tensor  * rot_out,
+        struct ggml_tensor  * ids,
+        int                   had,
+        struct ggml_tensor  * cmap,
+        struct ggml_tensor  * w1,
+        struct ggml_tensor  * w2) {
+    GGML_ASSERT(ids && cmap && w1 && "per-expert classes need ids, a class map and a second class");
+    GGML_ASSERT(cmap->type == GGML_TYPE_I32 && ggml_is_contiguous(cmap) && cmap->ne[1] == 1 && cmap->ne[2] == 1 && cmap->ne[3] == 1);
+    const int64_t n_exp = cmap->ne[0];
+    int64_t total = 0;
+    struct ggml_tensor * cls[3] = { a, w1, w2 };
+    for (int c = 0; c < 3; ++c) {
+        const struct ggml_tensor * w = cls[c];
+        if (w == NULL) {
+            continue;
+        }
+        GGML_ASSERT(ggml_is_exl3(w->type) && !w->view_src && w->ne[0] == a->ne[0] && w->ne[1] == a->ne[1] && w->ne[3] == 1);
+        GGML_ASSERT(w->nb[1] == ggml_row_size(w->type, w->ne[0]) && w->nb[2] == w->ne[1]*w->nb[1]);
+        total += w->ne[2];
+    }
+    GGML_ASSERT(total == n_exp && n_exp < (1 << 24));
+    struct ggml_tensor * result = ggml_mul_mat_had_impl(ctx, a, b, rot_in, rot_out, ids, had, n_exp);
+    result->src[5] = cmap;
+    result->src[6] = w1;
+    result->src[7] = w2;
     return result;
 }
 
@@ -4627,7 +4984,8 @@ struct ggml_tensor * ggml_conv_1d(
                 ggml_reshape_2d(ctx, im2col, im2col->ne[0], (im2col->ne[2] * im2col->ne[1])), // [N, OL, IC * K] => [N*OL, IC * K]
                 ggml_reshape_2d(ctx, a, (a->ne[0] * a->ne[1]), a->ne[2]));                    // [OC，IC, K] => [OC, IC * K]
 
-    result = ggml_reshape_3d(ctx, result, im2col->ne[1], a->ne[2], im2col->ne[2]); // [N, OC, OL]
+    result = ggml_reshape_3d(ctx, result, im2col->ne[1], im2col->ne[2], a->ne[2]); // [OC, N, OL]
+    result = ggml_cont(ctx, ggml_permute(ctx, result, 0, 2, 1, 3));                // [N, OC, OL]
 
     return result;
 }
@@ -6627,10 +6985,12 @@ struct ggml_tensor * ggml_dsv4_hc_comb(
 
 // ggml_dsv4_hc_pre
 
-struct ggml_tensor * ggml_dsv4_hc_pre(
+static struct ggml_tensor * ggml_dsv4_hc_pre_impl(
         struct ggml_context * ctx,
         struct ggml_tensor  * x,
-        struct ggml_tensor  * weights) {
+        struct ggml_tensor  * weights,
+        float                 scale,
+        bool                  gated) {
     GGML_ASSERT(x->type == GGML_TYPE_F32);
     GGML_ASSERT(weights->type == GGML_TYPE_F32);
 
@@ -6640,18 +7000,42 @@ struct ggml_tensor * ggml_dsv4_hc_pre(
 
     GGML_ASSERT(hc > 0);
     GGML_ASSERT(x->ne[3] == 1);
-    GGML_ASSERT(weights->ne[0] == hc);
-    GGML_ASSERT(weights->ne[1] == n_tokens);
-    GGML_ASSERT(weights->ne[2] == 1);
+    if (gated) {
+        GGML_ASSERT(weights->ne[0] == n_embd);
+        GGML_ASSERT(weights->ne[1] == hc);
+        GGML_ASSERT(weights->ne[2] == n_tokens);
+    } else {
+        GGML_ASSERT(weights->ne[0] == hc);
+        GGML_ASSERT(weights->ne[1] == n_tokens);
+        GGML_ASSERT(weights->ne[2] == 1);
+    }
     GGML_ASSERT(weights->ne[3] == 1);
 
     struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+
+    ggml_set_op_params_f32(result, 0, scale);
+    ggml_set_op_params_i32(result, 1, gated ? 1 : 0);
 
     result->op     = GGML_OP_DSV4_HC_PRE;
     result->src[0] = x;
     result->src[1] = weights;
 
     return result;
+}
+
+struct ggml_tensor * ggml_dsv4_hc_pre(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * weights) {
+    return ggml_dsv4_hc_pre_impl(ctx, x, weights, 1.0f, false);
+}
+
+struct ggml_tensor * ggml_dsv4_hc_pre_gated(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * gate,
+        float                 scale) {
+    return ggml_dsv4_hc_pre_impl(ctx, x, gate, scale, true);
 }
 
 // ggml_dsv4_hc_post
@@ -6665,7 +7049,6 @@ struct ggml_tensor * ggml_dsv4_hc_post(
     GGML_ASSERT(x->type == GGML_TYPE_F32);
     GGML_ASSERT(residual->type == GGML_TYPE_F32);
     GGML_ASSERT(post->type == GGML_TYPE_F32);
-    GGML_ASSERT(comb->type == GGML_TYPE_F32);
 
     const int64_t n_embd   = x->ne[0];
     const int64_t n_tokens = x->ne[1];
@@ -6684,10 +7067,13 @@ struct ggml_tensor * ggml_dsv4_hc_post(
     GGML_ASSERT(post->ne[2] == 1);
     GGML_ASSERT(post->ne[3] == 1);
 
-    GGML_ASSERT(comb->ne[0] == hc);
-    GGML_ASSERT(comb->ne[1] == hc);
-    GGML_ASSERT(comb->ne[2] == n_tokens);
-    GGML_ASSERT(comb->ne[3] == 1);
+    if (comb) {
+        GGML_ASSERT(comb->type == GGML_TYPE_F32);
+        GGML_ASSERT(comb->ne[0] == hc);
+        GGML_ASSERT(comb->ne[1] == hc);
+        GGML_ASSERT(comb->ne[2] == n_tokens);
+        GGML_ASSERT(comb->ne[3] == 1);
+    }
 
     struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
 
@@ -6696,6 +7082,71 @@ struct ggml_tensor * ggml_dsv4_hc_post(
     result->src[1] = residual;
     result->src[2] = post;
     result->src[3] = comb;
+
+    return result;
+}
+
+// ggml_top_k_mask
+
+struct ggml_tensor * ggml_top_k_mask(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * mask,
+        struct ggml_tensor  * top_k,
+        struct ggml_tensor  * score,
+        struct ggml_tensor  * blocks,
+        struct ggml_tensor  * extra) {
+    GGML_ASSERT(mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_F32);
+    GGML_ASSERT(mask->nb[0] == ggml_type_size(mask->type));
+    GGML_ASSERT(top_k->type == GGML_TYPE_I32);
+    GGML_ASSERT(top_k->ne[1] % mask->ne[1] == 0 && top_k->ne[2] % mask->ne[2] == 0 && top_k->ne[3] % mask->ne[3] == 0);
+
+    if (score) {
+        GGML_ASSERT(score->type == GGML_TYPE_F32);
+        GGML_ASSERT(score->ne[1] == top_k->ne[1] && score->ne[2] == top_k->ne[2] && score->ne[3] == top_k->ne[3]);
+    }
+
+    if (blocks) {
+        GGML_ASSERT(blocks->type == GGML_TYPE_I32);
+        GGML_ASSERT(blocks->ne[2] == 1 && blocks->ne[3] == 1);
+        GGML_ASSERT(!score || blocks->ne[1] == score->ne[0]);
+    }
+
+    if (extra) {
+        GGML_ASSERT(extra->type == GGML_TYPE_I32);
+        GGML_ASSERT(extra->ne[1] == top_k->ne[1] && extra->ne[2] == top_k->ne[2] && extra->ne[3] == top_k->ne[3]);
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, mask->type, mask->ne[0], top_k->ne[1], top_k->ne[2], top_k->ne[3]);
+
+    result->op     = GGML_OP_TOP_K_MASK;
+    result->src[0] = mask;
+    result->src[1] = top_k;
+    result->src[2] = score;
+    result->src[3] = blocks;
+    result->src[4] = extra;
+
+    return result;
+}
+
+// ggml_qsa_pack
+
+struct ggml_tensor * ggml_qsa_pack(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * cache,
+        bool                  values) {
+    GGML_ASSERT(cache->type == GGML_TYPE_F16 || cache->type == GGML_TYPE_Q8_0 || cache->type == GGML_TYPE_Q5_1);
+    GGML_ASSERT(cache->ne[0] == 256 && cache->ne[2] % 4 == 0 && cache->ne[3] == 1);
+    GGML_ASSERT(cache->nb[0] == ggml_type_size(cache->type) && cache->nb[1] >= ggml_row_size(cache->type, 256));
+
+    const int64_t N = cache->ne[1] * (cache->ne[2] / 4);   // heads x blocks of four cells
+    struct ggml_tensor * result = values
+        ? ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 4, 256, N)
+        : ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 16, 4, 16, N);
+
+    ggml_set_op_params_i32(result, 0, values ? 1 : 0);
+
+    result->op     = GGML_OP_QSA_PACK;
+    result->src[0] = cache;
 
     return result;
 }
@@ -7542,7 +7993,7 @@ static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
 
 static size_t ggml_graph_nbytes(size_t size, bool grads) {
     size_t hash_size = ggml_hash_size(size * 2);
-    void * p = 0;
+    void * p = (char *) 1024; // workaround for ubsan error "applying non-zero offset X to null pointer"
     incr_ptr_aligned(&p, sizeof(struct ggml_cgraph), 1);
     incr_ptr_aligned(&p, size * sizeof(struct ggml_tensor *), sizeof(struct ggml_tensor *)); // nodes
     incr_ptr_aligned(&p, size * sizeof(struct ggml_tensor *), sizeof(struct ggml_tensor *)); // leafs
@@ -7555,7 +8006,7 @@ static size_t ggml_graph_nbytes(size_t size, bool grads) {
     incr_ptr_aligned(&p, ggml_bitset_size(hash_size) * sizeof(ggml_bitset_t), sizeof(ggml_bitset_t));
 
     size_t nbytes = (size_t) p;
-    return nbytes;
+    return nbytes - 1024;
 }
 
 size_t ggml_graph_overhead_custom(size_t size, bool grads) {
@@ -8084,6 +8535,7 @@ void ggml_graph_dump_dot(const struct ggml_cgraph * gb, const struct ggml_cgraph
 ////////////////////////////////////////////////////////////////////////////////
 
 void ggml_set_input(struct ggml_tensor * tensor) {
+    GGML_ASSERT(tensor->op == GGML_OP_NONE);
     tensor->flags |= GGML_TENSOR_FLAG_INPUT;
 }
 

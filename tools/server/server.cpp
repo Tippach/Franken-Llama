@@ -1,3 +1,4 @@
+#include "server-connect.h"
 #include "server-context.h"
 #include "server-http.h"
 #include "server-models.h"
@@ -13,6 +14,7 @@
 #include "log.h"
 
 #include <atomic>
+#include <chrono>
 #include <clocale>
 #include <exception>
 #include <signal.h>
@@ -76,11 +78,53 @@ static void warn_if_low_commit_headroom() {
 }
 #endif
 
+// strixllama: STRIX_LOG_MAX_MB - the console log (the manager points stdout and stderr at one file) is cut back to what
+// the load wrote whenever it grows past this many MB, so a server that runs for days cannot fill the disk with it.
+// Checked every 10 s; a console, a pipe or the variable unset change nothing.
+static void strix_log_cap_start() {
+#if defined(_WIN32)
+    const char * m = getenv("STRIX_LOG_MAX_MB");
+    if (!m || atoi(m) <= 0) {
+        return;
+    }
+    HANDLE h = GetStdHandle(STD_ERROR_HANDLE);
+    if (h == INVALID_HANDLE_VALUE || h == nullptr || GetFileType(h) != FILE_TYPE_DISK) {
+        return;
+    }
+    const int64_t cap = (int64_t) atoi(m) << 20;
+    std::thread([h, cap]() {
+        // the load's last lines go through the log thread: give them a moment before taking the size they end at
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+        fflush(stdout);
+        fflush(stderr);
+        LARGE_INTEGER head;
+        if (!GetFileSizeEx(h, &head)) {
+            return;
+        }
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::seconds(10));
+            LARGE_INTEGER size;
+            if (!GetFileSizeEx(h, &size) || size.QuadPart <= cap) {
+                continue;
+            }
+            fflush(stdout);
+            fflush(stderr);
+            // stdout and stderr are one handle here, so the writing of every thread goes on from the cut
+            if (SetFilePointerEx(h, head, nullptr, FILE_BEGIN) && SetEndOfFile(h)) {
+                fprintf(stderr, "[strixllama] the log passed %lld MB: everything after the load was cut (STRIX_LOG_MAX_MB)\n",
+                        (long long) (cap >> 20));
+            }
+        }
+    }).detach();
+#endif
+}
+
 // satisfies -Wmissing-declarations (used by llama command)
 int llama_server(int argc, char ** argv);
 
 // to be used via CLI (argc / argv are used by router mode only)
 int llama_server(common_params & params, int argc, char ** argv);
+int llama_server(common_params & params, int argc, char ** argv, server_child & child);
 void llama_server_terminate();
 void llama_server_terminate() {
     if (shutdown_handler) {
@@ -99,6 +143,10 @@ static server_http_context::handler_t ex_wrapper(server_http_context::handler_t 
             return func(req);
         } catch (const std::invalid_argument & e) {
             // treat invalid_argument as invalid request (400)
+            error = ERROR_TYPE_INVALID_REQUEST;
+            message = e.what();
+        } catch (const common_json_error & e) {
+            // JSON parse and type errors are invalid requests (400)
             error = ERROR_TYPE_INVALID_REQUEST;
             message = e.what();
         } catch (const std::exception & e) {
@@ -126,6 +174,8 @@ static server_http_context::handler_t ex_wrapper(server_http_context::handler_t 
 }
 
 int llama_server(int argc, char ** argv) {
+    server_child child;
+
     std::setlocale(LC_NUMERIC, "C");
 
 #ifndef _WIN32
@@ -146,13 +196,22 @@ int llama_server(int argc, char ** argv) {
         return 1;
     }
 
+    SRV_INF("%s", "initializing ...\n");
+
     llama_backend_init();
     llama_numa_init(params.numa);
 
-    return llama_server(params, argc, argv);
+    const int result = llama_server(params, argc, argv, child);
+    common_log_flush(common_log_main());
+    return result;
 }
 
 int llama_server(common_params & params, int argc, char ** argv) {
+    server_child child;
+    return llama_server(params, argc, argv, child);
+}
+
+int llama_server(common_params & params, int argc, char ** argv, server_child & child) {
     bool is_run_by_cli = (argv == nullptr);
 
     common_models_handler models_handler;
@@ -216,11 +275,35 @@ int llama_server(common_params & params, int argc, char ** argv) {
         params.model_alias.insert(model_name);
     }
 
+    // check early, so a missing llama-connect fails-fast
+    if (params.server_connect) {
+        const std::string reason = server_connect::unavailable_reason(params);
+        if (!reason.empty()) {
+            SRV_ERR("--connect is not available: %s\n", reason.c_str());
+            return 1;
+        }
+        params.server_connect_code = server_connect::resolve_code(params.server_connect_code);
+    } else if (!params.server_connect_code.empty()) {
+        // the code is only meaningful while the tunnel runs, and /props keys off it being set
+        SRV_WRN("%s", "--connect-code is ignored without --connect\n");
+        params.server_connect_code.clear();
+    }
+
     // note: this is guaranteed to out-live ctx_http and tools
     server_mcp mcp_mgr;
 
     // struct that contains llama context and inference
     server_context ctx_server;
+
+    //
+    // Router
+    //
+
+    // register API routes
+    server_routes routes(params, ctx_server);
+    server_tools tools;
+
+    std::optional<server_models_routes> models_routes{};
 
     server_http_context ctx_http;
     if (!ctx_http.init(params)) {
@@ -228,16 +311,6 @@ int llama_server(common_params & params, int argc, char ** argv) {
         return 1;
     }
 
-    //
-    // Router
-    //
-
-    // register API routes
-    server_child child; // only used in non-router mode
-    server_routes routes(params, ctx_server);
-    server_tools tools;
-
-    std::optional<server_models_routes> models_routes{};
     if (is_router_server) {
         // setup server instances manager
         try {
@@ -257,12 +330,15 @@ int llama_server(common_params & params, int argc, char ** argv) {
         routes.post_control                = models_routes->proxy_post;
         routes.post_responses_oai          = models_routes->proxy_post;
         routes.post_transcriptions_oai     = models_routes->proxy_post;
+        routes.post_tts                    = models_routes->proxy_post;
+        routes.ws_realtime                 = models_routes->proxy_ws;
         routes.post_anthropic_messages     = models_routes->proxy_post;
         routes.post_anthropic_count_tokens = models_routes->proxy_post;
         routes.post_infill                 = models_routes->proxy_post;
         routes.post_embeddings             = models_routes->proxy_post;
         routes.post_embeddings_oai         = models_routes->proxy_post;
         routes.post_rerank                 = models_routes->proxy_post;
+        routes.post_systemone              = models_routes->proxy_post;
         routes.post_tokenize               = models_routes->proxy_post;
         routes.post_detokenize             = models_routes->proxy_post;
         routes.post_apply_template         = models_routes->proxy_post;
@@ -302,6 +378,8 @@ int llama_server(common_params & params, int argc, char ** argv) {
     ctx_http.post("/responses",                ex_wrapper(routes.post_responses_oai));
     ctx_http.post("/v1/audio/transcriptions",  ex_wrapper(routes.post_transcriptions_oai));
     ctx_http.post("/audio/transcriptions",     ex_wrapper(routes.post_transcriptions_oai));
+    ctx_http.post("/tts",                      ex_wrapper(routes.post_tts));
+    ctx_http.ws  ("/v1/realtime",              routes.ws_realtime);
     ctx_http.post("/v1/messages",              ex_wrapper(routes.post_anthropic_messages)); // anthropic messages API
     ctx_http.post("/infill",                   ex_wrapper(routes.post_infill));
     ctx_http.post("/embedding",                ex_wrapper(routes.post_embeddings)); // legacy
@@ -311,6 +389,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
     ctx_http.post("/reranking",                ex_wrapper(routes.post_rerank));
     ctx_http.post("/v1/rerank",                ex_wrapper(routes.post_rerank));
     ctx_http.post("/v1/reranking",             ex_wrapper(routes.post_rerank));
+    ctx_http.post("/v1/systemone",             ex_wrapper(routes.post_systemone));
     ctx_http.post("/tokenize",                 ex_wrapper(routes.post_tokenize));
     ctx_http.post("/detokenize",               ex_wrapper(routes.post_detokenize));
     ctx_http.post("/apply-template",           ex_wrapper(routes.post_apply_template));
@@ -365,17 +444,17 @@ int llama_server(common_params & params, int argc, char ** argv) {
     };
 
     if (params.cors_origins == "*" && params.api_keys.empty()) {
-        SRV_WRN("%s", "-----------------\n");
-        SRV_WRN("%s", "CORS is set to allow all origins ('*') and no API key is set\n");
-        SRV_WRN("%s", "this can be a security risk (cross-origin attacks)\n");
-        SRV_WRN("%s", "more info: https://github.com/ggml-org/llama.cpp/pull/25655\n");
-        SRV_WRN("%s", "-----------------\n");
+        SRV_WRN("%s", "security: no API key is set and CORS allows all origins (see https://github.com/ggml-org/llama.cpp/pull/25655)\n");
     }
 
     // CORS proxy (EXPERIMENTAL, only used by the Web UI for MCP)
     std::vector<std::string> warn_names;
     if (is_router_server) {
         warn_names.push_back("router mode");
+    }
+
+    if (params.server_connect) {
+        warn_names.push_back("peer-to-peer tunnel (llama-connect, experimental)");
     }
 
     if (params.ui_mcp_proxy) {
@@ -417,14 +496,13 @@ int llama_server(common_params & params, int argc, char ** argv) {
         ctx_http.post("/tools",           ex_wrapper(res_403));
     }
 
-    if (warn_names.size() > 0) {
-        SRV_WRN("%s", "-----------------\n");
-        SRV_WRN("%s", "the following feature(s) are enabled:\n");
+    if (!warn_names.empty()) {
+        std::string features;
         for (const auto & name : warn_names) {
-            SRV_WRN("    %s\n", name.c_str());
+            if (!features.empty()) features += ", ";
+            features += name;
         }
-        SRV_WRN("%s", "do not expose the server to untrusted environments\n");
-        SRV_WRN("%s", "-----------------\n");
+        SRV_WRN("security: %s enabled - do not expose to untrusted environments\n", features.c_str());
     }
 
     //
@@ -486,9 +564,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
         } catch (const std::exception & e) {
             SRV_ERR("failed to load models on startup: %s\n", e.what());
             ctx_http.stop();
-            if (ctx_http.thread.joinable()) {
-                ctx_http.thread.join();
-            }
+            ctx_http.join();
             clean_up();
             return 1;
         }
@@ -521,9 +597,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
 
         if (!ctx_server.load_model(params)) {
             clean_up();
-            if (ctx_http.thread.joinable()) {
-                ctx_http.thread.join();
-            }
+            ctx_http.join();
             SRV_ERR("%s", "exiting due to model loading error\n");
             return 1;
         }
@@ -561,13 +635,19 @@ int llama_server(common_params & params, int argc, char ** argv) {
     warn_if_low_commit_headroom();
 #endif
 
-    SRV_INF("listening on %s\n", ctx_http.listening_address.c_str());
+    for (const auto & address : ctx_http.listening_addresses) {
+        SRV_INF("listening on %s\n", address.c_str());
+    }
+    strix_log_cap_start();
 
-    // TODO: remove this in the future
-    // check the string to also handle the .sock case
-    if (string_ends_with(ctx_http.listening_address, ":8080")) {
-        SRV_WRN("%s", "NOTICE: server default port will be changed to :9931 in a future release\n");
-        SRV_WRN("%s", "        ref: https://github.com/ggml-org/llama.cpp/pull/26508\n");
+    // spawn only once listening, so the port is bound and the child startup health check reaches us. the destructor stops it
+    server_connect connect_proc;
+    if (params.server_connect && !connect_proc.start(params, ctx_http.port)) {
+        SRV_ERR("%s", "exiting due to llama-connect error\n");
+        ctx_http.stop();
+        ctx_http.join();
+        clean_up();
+        return 1;
     }
 
     if (is_router_server) {
@@ -576,9 +656,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
             SRV_WRN("%s", "      please only use presets that you can trust! Unknown presets may be unsafe\n");
         }
 
-        if (ctx_http.thread.joinable()) {
-            ctx_http.thread.join(); // keep the main thread alive
-        }
+        ctx_http.join(); // keep the main thread alive
 
         // when the HTTP server stops, clean up and exit
         clean_up();
@@ -594,9 +672,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
         ctx_server.start_loop();
 
         clean_up();
-        if (ctx_http.thread.joinable()) {
-            ctx_http.thread.join();
-        }
+        ctx_http.join();
         if (monitor_thread.joinable()) {
             monitor_thread.join();
         }

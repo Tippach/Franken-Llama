@@ -209,7 +209,15 @@ void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
         mem_attn->state_read(io, seq_id, flags, pos_lo, pos_limit);
     }
     if (read_recr) {
-        mem_recr->state_read(io, seq_id, flags, pos_lo, pos_limit);
+        try {
+            mem_recr->state_read(io, seq_id, flags, pos_lo, pos_limit);
+        } catch (...) {
+            // a failed restore leaves the sequence empty in both caches
+            if (read_attn) {
+                mem_attn->state_clear(seq_id);
+            }
+            throw;
+        }
     }
 }
 
