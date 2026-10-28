@@ -36,13 +36,15 @@ The launcher does **not** scan for models. It uses the `MODEL` / `MTP` values in
 ## Overriding defaults
 Set these in the environment before launching (or edit the `EDIT ME` block in `strix.bat`).
 An already-set environment value always wins over the file's default:
-- `MODEL`  — model gguf path, or an `org/repo:quant` HF checkpoint (default: the HF `UD-IQ4_XS` checkpoint)
-- `MTP`    — MTP draft: an HF `org/repo[:quant]` (default: the shared MTP head in the model's repo,
+- `MODEL`  — model gguf path, or an `org/repo:quant` HF checkpoint (default: the HF `EXL3 4.05bpw` checkpoint)
+- `MTP`    — MTP draft: an HF `org/repo[:quant]` (default: the own-head MTP draft in the EXL3 repo,
   downloaded on first launch), a local `.gguf` path, or `none` to disable speculative decoding
 - `MTP_FILE` — in-repo path to the draft file when `MTP` is an HF repo whose draft is not at the
-  repo root (default: `MTP/mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf`)
+  repo root (default: `mtp-Qwen3.8-Flash-Next-lr512-ownhead.gguf`)
 - `LATIN`      — `1` trims the draft's borrowed LM head to a 32768-token Latin shortlist **at load**
-  (default `1`); `0` keeps the full-vocabulary head. See "Speculative decode (MTP draft)".
+  (default `1`); `0` keeps the full-vocabulary head. An own-head draft (the default shape) has no d2t
+  mapping, so the launcher forces this to `0` for it and says so - the server refuses the trim there.
+  See "Speculative decode (MTP draft)".
 - `CTX`    — context size in tokens (default 524288). The model is trained to 262144, so the default
   context rides on `YARN=1`; set `YARN=0` to stay inside the trained range.
 - `YARN`     — `1` enables YaRN rope scaling so `CTX` can exceed the trained 262144 (default `1`)
@@ -51,8 +53,8 @@ An already-set environment value always wins over the file's default:
 - `PORT`   — listen port (default 9931)
 - `HOSTIP` — bind address (default 127.0.0.1)
 - `PARALLEL`   — concurrent conversations / slots (default `2`)
-- `KVQ8`       — `1` stores the KV cache, and the MTP draft's, as q8_0 instead of f16 (default `1`);
-  `0` keeps both unquantized. Roughly halves the cache — about 6.4 GB at 512k context. See
+- `KVQ8`       — `1` stores the KV cache, and the MTP draft's, as q8_0 instead of f16 (default `0`);
+  `0` keeps both unquantized. `1` roughly halves the cache — about 6.4 GB at 512k context. See
   "Context size and YaRN".
 - `CACHE`      — prompt cache on disk: `kvchain` (default) / `disk` / `auto` / `off`. Exactly one
   mechanism runs — the server refuses to start with both. See "Prompt cache on disk".
@@ -89,9 +91,13 @@ Measured on this box at scale 2 / 512k, single slot, KV in **f16** (`KVQ8=0`), `
 loads and runs using about **97 GB of the ~108 GB available to the GPU** (a 96 GB dedicated carve plus
 16 GB of shared memory), i.e. roughly 10 GB of headroom.
 
-The default KV type is q8_0 (`KVQ8=1`), which roughly halves that cache: f16 costs about 6.5 GB per
-262k of context, q8_0 about 3.2 GB, so the 512k default is about **6.4 GB smaller** than the f16
-figure above. Context beyond that needs a smaller `-ub`.
+The default is exactly that: **the KV cache is left unquantized** (`KVQ8=0`). Measured with the default
+checkpoint at the shipping shape — `CTX=524288`, `PARALLEL=2`, `KVQ8=0`, `-ub 8192` — the server reserves
+about **93 GiB of the ~100 GiB visible to it** (64.0 GiB weights + 14.6 GiB KV + 16.0 GiB peak compute),
+so there is no headroom problem to solve here. Set `KVQ8=1` to reclaim about 6.4 GB when running a tighter
+shape: it roughly halves the cache (f16 costs about 6.5 GB per 262k of context, q8_0 about 3.2 GB), which
+is the lever for context beyond 512k or a larger `-ub`. The KV type is hashed into the prompt-cache root,
+so switching it re-prefills cached chains once.
 
 ### Batch size (`-b` / `-ub`) - a tuning knob, not a validated default
 
@@ -206,17 +212,33 @@ modes: `strix_gui.exe --selftest` prints the exact command line each checkpoint 
 `--status` reads a server already running on the port.
 It offers a **checkpoint dropdown**, checkboxes for the quick-access knobs (vision, q8_0 KV cache,
 MTP speculative decode, the Latin draft trim, YaRN, HTTPS), a context-size and slot picker, and the
-prompt-cache mode. **Launch** starts the server with no console window; **Stop** shuts it down.
+prompt-cache mode. The q8_0 KV box starts **unchecked**: the default runs with an unquantized cache.
+**Launch** starts the server with no console window; **Stop** shuts it down.
 
-The dropdown offers four checkpoints: `UD-IQ4_XS` (the shipping default, and the one every number in
-this README was measured on), `ISTA IQ3_S` (per-tensor mixed precision, smaller), `Swift 1.5 IQ4_XS`
-(an agent/reasoning fine-tune of the same base by a different quantizer, and the largest at about 98 GB
-across its three shards) and `Huihui IQ4_XS` (an abliterated, refusal-disabled re-quant of the same
-UD-IQ4_XS base — same quant, same size class). All four are the same architecture and share the same MTP
-draft head. The launcher resolves and downloads whichever checkpoint you pick on first launch, so the
-first start of a new one is a large download.
+The dropdown offers five checkpoints, and **`EXL3 4.05bpw` is the shipping default**. The other four are
+GGUF-native quantizations of the same base: `UD-IQ4_XS` (unsloth's, ~87 GB), `ISTA IQ3_S` (per-tensor
+mixed precision, smaller), `Swift 1.5 IQ4_XS` (an agent/reasoning fine-tune of the same base by a
+different quantizer, and the largest at about 98 GB across its three shards) and `Huihui IQ4_XS` (an
+abliterated, refusal-disabled re-quant of the same UD-IQ4_XS base — same quant, same size class). Those
+four are the same architecture and share one MTP draft head. The launcher resolves and downloads
+whichever checkpoint you pick on first launch, so the first start of a new one is a large download.
 
-**`UD-IQ4_XS`, `ISTA IQ3_S` and `Huihui IQ4_XS` run with the packaged chat template**, not the one
+**`EXL3 4.05bpw` is the quality option and the exception to the two rules above.** It is not a GGUF-native
+quantization: the weights are turboderp's EXL3 trellis code (repacked into a GGUF container by rulith,
+GGUF type ids 256 and up) at 4.05 bits per weight across six shards (~104 GB; the first shard is metadata
+only, and the 39 GB n-gram table streams from disk). Its KL divergence to the BF16 model is **0.022**
+versus **0.048** for `UD-IQ4_XS` - that figure is the upstream repository's own measurement (six text
+domains, context 1024, Rulith Inference at its defaults), not something we re-ran here. What we did
+measure on this box is speed: with identical launch settings EXL3 decoded at least as fast as
+`UD-IQ4_XS` (42.7 vs 40.9 t/s over a 1024-token generation, MTP on), so its value is fidelity without a
+speed tax.
+Because an EXL3 output layer cannot lend rows to a shared draft head, this checkpoint uses its **own MTP
+draft** (`mtp-...-lr512-ownhead.gguf` from the same repo) instead of the shared Q4_K_M head the other four
+use. That draft carries a full-vocabulary head with no d2t mapping, so the **Latin draft trim does not
+apply**: the launcher disables the checkbox and never passes `--spec-draft-vocab-latin` for this checkpoint
+(the server would reject the combination outright).
+
+**`UD-IQ4_XS`, `ISTA IQ3_S`, `Huihui IQ4_XS` and `EXL3 4.05bpw` run with the packaged chat template**, not the one
 embedded in their own file: the launcher passes `--chat-template-file launcher\chat_template.jinja` for
 them. **`Swift 1.5 IQ4_XS` runs with its own embedded template** — it is a fine-tune whose template
 differs from the base model's, so the launcher leaves it unmodified (no `--chat-template-file`). For any

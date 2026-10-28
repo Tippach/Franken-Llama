@@ -46,10 +46,14 @@ keep their own licenses, listed under `licenses/` and in `vendor/`.
 Model weights are **not** part of this repository. The launcher resolves them from Hugging Face
 on first use:
 
+- **[Rulith/Qwen3.8-Flash-Next-Rulith-EXL3-GGUF](https://huggingface.co/Rulith/Qwen3.8-Flash-Next-Rulith-EXL3-GGUF)** —
+  the default checkpoint (`EXL3-4.05bpw`, turboderp EXL3 trellis weights repacked into a GGUF
+  container) and its matching own-head MTP draft (`mtp-Qwen3.8-Flash-Next-lr512-ownhead.gguf`).
 - **[unsloth/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)** —
-  the quantised target model (`UD-IQ4_XS` by default) and the MTP speculative-decoding draft
-  (`MTP/mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf`).
-- The underlying model architecture is Qwen; the quantisations are Unsloth's GGUF conversions.
+  selectable from the launcher's checkpoint dropdown: the `UD-IQ4_XS` quantisation and the shared MTP
+  draft (`MTP/mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf`) used by the GGUF-native checkpoints.
+- The underlying model architecture is Qwen; the GGUF quantisations are Unsloth's conversions and the
+  EXL3 repack is rulith's.
 
 ## Toolchain
 

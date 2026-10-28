@@ -42,16 +42,18 @@ REM    YARN=1       rope scaling so CTX can exceed the trained 262144. Pair with
 REM                 CTX=524288 for ~512k context. Leave YARN=0 at or below 262144.
 REM    CTX=524288   context size in tokens; go above 262144 only together with YARN=1.
 REM    KVQ8=1       quantize the KV cache - and the MTP draft's - to q8_0: adds
-REM                 -ctk q8_0 -ctv q8_0 -ctkd q8_0 -ctvd q8_0. Default on; KVQ8=0 keeps
-REM                 the cache unquantized.
-REM  The defaults below are the validated shipping config: two 512k conversations with
-REM  YaRN and the KV cache at q8_0. A shell can still override any of them.
+REM                 -ctk q8_0 -ctv q8_0 -ctkd q8_0 -ctvd q8_0. Default OFF (f16 cache);
+REM                 set KVQ8=1 to halve the cache when headroom is needed.
+REM  The defaults below are the validated shipping config: the EXL3 4.05bpw checkpoint, two 512k
+REM  conversations with YaRN, and an UNQUANTIZED KV cache. That shape reserves about 93 GiB of the
+REM  ~100 GiB visible on this box, so the cache does not need compressing here.
+REM  A shell can still override any of them.
 REM ============================================================================
 if not defined VISION set "VISION=1"
 if not defined PARALLEL set "PARALLEL=2"
 if not defined YARN set "YARN=1"
 if not defined CTX set "CTX=524288"
-if not defined KVQ8 set "KVQ8=1"
+if not defined KVQ8 set "KVQ8=0"
 
 REM ============================================================================
 REM  EDIT ME - the end-user knobs. An already-set environment value wins over
@@ -59,15 +61,17 @@ REM  each 'if not defined' line, so a shell can override without editing this fi
 REM ============================================================================
 
 REM Model: an HF checkpoint (resolved by the server) or a local .gguf.
-if not defined MODEL set "MODEL=unsloth/Qwen3.8-Flash-Next-GGUF:UD-IQ4_XS"
+if not defined MODEL set "MODEL=Rulith/Qwen3.8-Flash-Next-Rulith-EXL3-GGUF:EXL3-4.05bpw"
 
 REM MTP draft. Default: pulled from Hugging Face on first launch, cached afterwards.
 REM   MTP=<local.gguf>   a local draft file
 REM   MTP=<repo:quant>   a different HF draft repo (set MTP_FILE too if it is not at repo root)
 REM   MTP=none           no speculative decoding
+REM The draft must come from the same repo as an EXL3 target: an EXL3 model cannot lend LM-head rows
+REM to a shared draft, so the other checkpoints' shared Q4_K_M head does not apply to the default.
 if not defined MTP (
-  set "MTP=unsloth/Qwen3.8-Flash-Next-GGUF"
-  set "MTP_FILE=MTP/mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf"
+  set "MTP=Rulith/Qwen3.8-Flash-Next-Rulith-EXL3-GGUF"
+  set "MTP_FILE=mtp-Qwen3.8-Flash-Next-lr512-ownhead.gguf"
 )
 if /I "!MTP!"=="none" set "MTP="
 
@@ -98,6 +102,18 @@ REM every draft step. LATIN=1 trims it at load to a 32768-token Latin shortlist:
 REM output (the target still verifies over the full vocabulary) with far less bandwidth.
 REM Tuned for Latin/English. For Chinese or other CJK set LATIN=0.
 if not defined LATIN set "LATIN=1"
+
+REM An own-head draft (file name contains "ownhead") carries a full-vocab head with NO d2t map, so
+REM --spec-draft-vocab-latin is a hard startup ERROR for it rather than a silent no-op. Force the
+REM trim off for that draft shape whatever LATIN said, and say why: the GUI enforces the same rule
+REM by disabling its checkbox. The substring test strips "ownhead" and compares what is left.
+if defined MTP_FILE if not "!MTP_FILE!"=="!MTP_FILE:ownhead=!" (
+  if "!LATIN!"=="1" (
+    set "LATIN=0"
+    echo  NOTE : Latin draft trim forced OFF - the draft "!MTP_FILE!" has its own full-vocab head
+    echo         with no d2t mapping, so the server refuses to trim it.
+  )
+)
 
 REM --- prompt cache on disk ---------------------------------------------------------
 REM Exactly ONE mechanism runs (they are mutually exclusive - the server refuses both).

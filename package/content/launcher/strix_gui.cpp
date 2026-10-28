@@ -47,10 +47,15 @@
 // checkpoint; it launches with an empty CTPL so the server uses the template embedded in the
 // model's own GGUF (the same result as clearing CTPL in strix.bat). --jinja is already the server
 // default, so no template flag is emitted on this path.
+// noLatin: the checkpoint's MTP draft carries its own full-vocab LM head with no d2t mapping, so
+// --spec-draft-vocab-latin must NOT be requested: common_speculative turns that into a hard startup
+// error ("draft model has no d2t draft-vocab mapping") instead of silently running untrimmed, and
+// the load-time trim is impossible here anyway - an EXL3 head is trellis-coded, its rows cannot be
+// gathered as contiguous quant blocks. The Latin checkbox is disabled for such a checkpoint.
 struct Model { const wchar_t* label; const wchar_t* repo; const wchar_t* draft; const wchar_t* draftFile;
-               bool embeddedTpl = false; };
+               bool embeddedTpl = false; bool noLatin = false; };
 static const Model MODELS[] = {
-    { L"UD-IQ4_XS  (shipping default)", L"unsloth/Qwen3.8-Flash-Next-GGUF:UD-IQ4_XS",
+    { L"UD-IQ4_XS  (unsloth quant)", L"unsloth/Qwen3.8-Flash-Next-GGUF:UD-IQ4_XS",
       L"unsloth/Qwen3.8-Flash-Next-GGUF", L"MTP/mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf" },
     { L"ISTA IQ3_S  (GSQ-RCO)", L"ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF:IQ3_S",
       L"unsloth/Qwen3.8-Flash-Next-GGUF", L"MTP/mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf" },
@@ -72,8 +77,24 @@ static const Model MODELS[] = {
     // the root base mmproj is picked over the repo's Swift mmproj (find_best_sibling, verified).
     { L"Huihui IQ4_XS  (abliterated)", L"huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-v2-GGUF:UD-IQ4_XS",
       L"unsloth/Qwen3.8-Flash-Next-GGUF", L"MTP/mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf" },
+    // EXL3 (turboderp trellis quants, repacked to GGUF by rulith for this engine; GGUF type ids 256+).
+    // 4.05 bpw: KL to BF16 0.022 vs UD-IQ4_XS 0.048 - the upstream repo's own measurement (six domains,
+    // ctx 1024), not ours; on this box it decoded at least as fast as UD (42.7 vs 40.9 t/s, MTP on).
+    // The quality option, 104.3 GB across 6 shards (first shard is metadata only). The n-gram table
+    // streams from disk (lazy on-direct), so resident weight pressure is what it is for any quant here.
+    // Its MTP draft MUST be the lr512 own-head file from the same repo: an EXL3 target cannot lend
+    // LM-head rows to a shared draft, which is why the other checkpoints' shared Q4_K_M head does not
+    // apply - and with a full-vocab own head there is no d2t, so noLatin (see struct note).
+    // The repo's root mmproj-F16.gguf is what --mmproj-auto resolves for vision (verified at promote).
+    { L"EXL3 4.05bpw  (shipping default)", L"Rulith/Qwen3.8-Flash-Next-Rulith-EXL3-GGUF:EXL3-4.05bpw",
+      L"Rulith/Qwen3.8-Flash-Next-Rulith-EXL3-GGUF", L"mtp-Qwen3.8-Flash-Next-lr512-ownhead.gguf",
+      false, true },
 };
 static const int N_MODELS = (int)(sizeof(MODELS) / sizeof(MODELS[0]));
+// The checkpoint a fresh launch selects, so the default is a named constant instead of the accident of
+// array order. --selftest asserts the index and that the default needs no Latin trim, which is what
+// catches a MODELS[] reorder silently moving the default somewhere unintended.
+static const int DEFAULT_MODEL = 4;   // EXL3 4.05bpw
 static const int CTX_VALUES[] = { 131072, 262144, 524288 };
 
 // ------------------------------------------------------------------ control ids
@@ -288,10 +309,12 @@ static std::wstring readLogTail() {
 
 // ------------------------------------------------------------------ command-line builder (mirrors strix.bat)
 struct Opts {
-    int model = 0, ctx = 524288, port = 9931, parallel = 2, yarnScale = 2;
+    int model = DEFAULT_MODEL, ctx = 524288, port = 9931, parallel = 2, yarnScale = 2;
     int cache = 0;                 // 0 kvchain, 1 disk, 2 off
     bool loopback = true;
-    bool yarn = true, kvq8 = true, vision = true, mtp = true, latin = true, ssl = false;
+    // kvq8 defaults OFF: the shipping checkpoint fits the full 512k / 2-slot shape with an
+    // UNQUANTIZED (f16) KV cache, so quality is not traded for headroom that is not needed.
+    bool yarn = true, kvq8 = false, vision = true, mtp = true, latin = true, ssl = false;
     bool withEndpoints = true;
     std::wstring apiKey, cacheDir, tmpl, sslKey, sslCert;
     int kvchainGb = 100, pccacheGb = 64;
@@ -339,7 +362,8 @@ static bool buildArgs(const Opts& o, std::wstring& args, std::wstring& err) {
     if (o.mtp && m.draft && m.draft[0]) {
         addLine(args, fmt(L"-hfd \"%s\" -md \"%s\"", m.draft, m.draftFile));
         addLine(args, L"--spec-type draft-mtp --spec-draft-ngl 99 --spec-draft-n-max 3 --spec-draft-p-min 0.30");
-        if (o.latin) addLine(args, L"--spec-draft-vocab-latin");
+        // noLatin checkpoints throw at startup if the trim is required - never emit the flag for them
+        if (o.latin && !m.noLatin) addLine(args, L"--spec-draft-vocab-latin");
     }
     if (o.ssl) {
         if (!fileExists(o.sslKey) || !fileExists(o.sslCert)) { err = L"HTTPS is on but key/cert files are missing."; return false; }
@@ -592,6 +616,7 @@ static void stopWorker() { g_poll = false; if (g_worker.joinable()) g_worker.joi
 // ------------------------------------------------------------------ UI state helpers
 static COLORREF g_keyHintColor = RGB(90, 90, 90);
 static void syncKeyHint();
+static void syncLatinEnabled(int modelIdx);   // defined with the window code; setUi re-asserts it
 static void setUi(bool running) {
     EnableWindow(g_btnLaunch, !running);
     EnableWindow(g_btnStop, running);
@@ -604,6 +629,11 @@ static void setUi(bool running) {
     EnableWindow(g_hSpin, !running);    EnableWindow(g_hCache, !running);
     EnableWindow(g_hBind, !running);
     if (!running) syncKeyHint(); else EnableWindow(g_hKey, FALSE);
+    // EnableWindow(g_ckLatin, TRUE) above blindly re-enables the trim box, which would UNDO the
+    // own-head veto made in WM_CREATE / on model change. Re-assert the model policy after it, so a
+    // checkpoint whose draft cannot be trimmed stays disabled after every start/stop transition.
+    // Invisible while the default checkpoint allowed the trim; the EXL3 default exposed it.
+    if (!running) syncLatinEnabled((int)SendMessage(g_hModel, CB_GETCURSEL, 0, 0));
     if (!running) { g_light = LIGHT[0]; InvalidateRect(g_hLight, nullptr, TRUE); SetWindowTextW(g_hState, L"Stopped"); }
 }
 static void syncKeyHint() {
@@ -657,6 +687,10 @@ static Opts gatherOpts() {
     o.apiKey = editText(g_hKey);
     o.yarn = isChecked(g_ckYarn); o.kvq8 = isChecked(g_ckKvQ8); o.vision = isChecked(g_ckVision);
     o.mtp = isChecked(g_ckMtp);   o.latin = isChecked(g_ckLatin); o.ssl = isChecked(g_ckSsl);
+    // Defense-in-depth: a noLatin checkpoint's own-head draft cannot be trimmed and the server turns
+    // that combination into a startup error. If the checkbox is somehow still set (enable-gate
+    // regression, or a scripted BM_SETCHECK), drop the flag rather than emit a refused command.
+    if (MODELS[o.model].noLatin) o.latin = false;
     o.cache = comboSel(g_hCache); if (o.cache < 0) o.cache = 0;
     o.port = g_port;
     o.cacheDir = dirJoin(g_here, L"prompt-cache");
@@ -686,6 +720,16 @@ static HWND mkid(const wchar_t* cls, const wchar_t* text, DWORD style, int x, in
     return c;
 }
 
+// A noLatin checkpoint (own-head draft without a d2t mapping) must not offer Latin trim: the flag
+// is dropped in gatherOpts() and the checkbox is unchecked + disabled here so the reason is visible.
+// Called from WM_CREATE after CB_SETCURSEL and from WM_COMMAND on model change.
+static void syncLatinEnabled(int modelIdx) {
+    if (!g_ckLatin || modelIdx < 0 || modelIdx >= N_MODELS) return;
+    bool allow = !MODELS[modelIdx].noLatin;
+    EnableWindow(g_ckLatin, allow);
+    if (!allow) SendMessage(g_ckLatin, BM_SETCHECK, BST_UNCHECKED, 0);
+}
+
 static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     switch (msg) {
     case WM_CREATE: {
@@ -695,7 +739,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         mk(L"STATIC", L"Checkpoint", 0, 26, 34, 74, 20);
         g_hModel = mkid(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, 104, 31, 250, 200, IDC_MODEL);
         for (int i = 0; i < N_MODELS; i++) SendMessageW(g_hModel, CB_ADDSTRING, 0, (LPARAM)MODELS[i].label);
-        SendMessage(g_hModel, CB_SETCURSEL, 0, 0);
+        SendMessage(g_hModel, CB_SETCURSEL, DEFAULT_MODEL, 0);
         g_hRuntime = mk(L"STATIC", L"", 0, 366, 34, 316, 20);
         // ---- Quick access group
         mk(L"BUTTON", L"Quick access", BS_GROUPBOX, 12, 90, 680, 128);
@@ -705,7 +749,9 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         g_ckLatin  = mkid(L"BUTTON", L"Latin draft trim",     BS_AUTOCHECKBOX, 196, 140, 152, 22, IDC_LATIN);
         g_ckYarn   = mkid(L"BUTTON", L"YaRN rope scaling",    BS_AUTOCHECKBOX, 352, 114, 152, 22, IDC_YARN);
         g_ckSsl    = mkid(L"BUTTON", L"HTTPS (needs certs)",  BS_AUTOCHECKBOX, 352, 140, 152, 22, IDC_SSL);
-        for (HWND c : { g_ckVision, g_ckKvQ8, g_ckMtp, g_ckLatin, g_ckYarn }) SendMessage(c, BM_SETCHECK, BST_CHECKED, 0);
+        // KV q8_0 is deliberately NOT pre-checked: the default ships an unquantized KV cache.
+        for (HWND c : { g_ckVision, g_ckMtp, g_ckLatin, g_ckYarn }) SendMessage(c, BM_SETCHECK, BST_CHECKED, 0);
+        syncLatinEnabled((int)SendMessage(g_hModel, CB_GETCURSEL, 0, 0));
         mk(L"STATIC", L"Context", 0, 512, 116, 50, 20);
         g_hCtx = mkid(L"COMBOBOX", L"", CBS_DROPDOWNLIST, 566, 113, 100, 200, IDC_CTX);
         for (int v : CTX_VALUES) { std::wstring s = std::to_wstring(v); SendMessageW(g_hCtx, CB_ADDSTRING, 0, (LPARAM)s.c_str()); }
@@ -783,6 +829,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         int id = LOWORD(w), code = HIWORD(w);
         if (id == IDC_BIND && code == CBN_SELCHANGE) syncKeyHint();
         if (id == IDC_KEY && code == EN_CHANGE) syncKeyHint();
+        if (id == IDC_MODEL && code == CBN_SELCHANGE) syncLatinEnabled(comboSel(g_hModel));
         if (id == IDC_LAUNCH) {
             Opts o = gatherOpts();
             std::wstring args, err;
@@ -885,9 +932,36 @@ static int runSelftest() {
     }
     printf("template policy (embedded checkpoints omit --chat-template-file): %s\n",
            tplOk ? "yes" : "NO (BUG)");
+    // latin policy: a checkpoint flagged noLatin must launch WITHOUT --spec-draft-vocab-latin even
+    // when the trim box would be checked (its own-head draft has no d2t, so the server refuses that
+    // combination); the others must carry it. Proves the buildArgs gate headlessly.
+    int latinOk = 1;
+    for (int i = 0; i < N_MODELS; i++) {
+        Opts o; o.model = i; o.cacheDir = dirJoin(g_here, L"prompt-cache"); o.latin = true;
+        std::wstring a, e; bool built = buildArgs(o, a, e);
+        bool has = built && a.find(L"--spec-draft-vocab-latin") != std::wstring::npos;
+        bool want = !MODELS[i].noLatin;
+        if (has != want) latinOk = 0;
+    }
+    printf("latin policy (own-head-draft checkpoints omit --spec-draft-vocab-latin): %s\n",
+           latinOk ? "yes" : "NO (BUG)");
+    // default policy: what a fresh launch gets. Both directions are asserted because the default is
+    // now the EXL3 checkpoint with an UNQUANTIZED KV cache - a regression here (array reorder, or a
+    // stray -ctk) changes what every user gets without anyone touching a checkbox.
+    int defOk = 1;
+    {
+        Opts o; o.cacheDir = dirJoin(g_here, L"prompt-cache");
+        std::wstring a, e; bool built = buildArgs(o, a, e);
+        bool okRepo = built && a.find(MODELS[DEFAULT_MODEL].repo) != std::wstring::npos;
+        bool okNoQ8 = built && a.find(L"-ctk") == std::wstring::npos;
+        printf("default checkpoint: %s\n", wtou8(MODELS[DEFAULT_MODEL].label).c_str());
+        printf("default kv unquantized: %s ; default checkpoint in default args: %s\n",
+               okNoQ8 ? "yes" : "NO (BUG)", okRepo ? "yes" : "NO (BUG)");
+        if (!okNoQ8 || !okRepo) defOk = 0;
+    }
     // the API key is optional: 0.0.0.0 with no key must still build (and emit no --api-key), while a
     // provided key must be passed through.
-    Opts net0; net0.model = 0; net0.loopback = false; net0.cacheDir = dirJoin(g_here, L"prompt-cache");
+    Opts net0; net0.model = DEFAULT_MODEL; net0.loopback = false; net0.cacheDir = dirJoin(g_here, L"prompt-cache");
     std::wstring a2, e2;
     bool okNoKey = buildArgs(net0, a2, e2) && a2.find(L"--api-key") == std::wstring::npos;
     Opts net1 = net0; net1.apiKey = L"k";
@@ -895,7 +969,7 @@ static int runSelftest() {
     bool okKey = buildArgs(net1, a3, e3) && a3.find(L"--api-key") != std::wstring::npos;
     printf("network no-key allowed: %s ; with-key passes --api-key: %s\n",
            okNoKey ? "yes" : "NO (BUG)", okKey ? "yes" : "NO (BUG)");
-    return (okNoKey && okKey && tplOk) ? 0 : 2;
+    return (okNoKey && okKey && tplOk && latinOk && defOk) ? 0 : 2;
 }
 static int runStatus() {
     HINTERNET s = WinHttpOpen(L"StrixLauncher/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
@@ -946,6 +1020,8 @@ static int runSmoke() {
     // refuse rather than stack a second server on a live one (and on UMA, OOM trying)
     DWORD busy = findServerPid(g_port);
     if (busy) { printf("port %d already owned by pid %lu - stop it first, or use --status to just read it\n", g_port, busy); return 3; }
+    // model 0 (UD) is DELIBERATE, not the shipped default: --smoke must stay light, and the default
+    // checkpoint is a ~104 GB six-shard download. Do not replace this with DEFAULT_MODEL.
     Opts o; o.model = 0; o.ctx = 16384; o.parallel = 1; o.yarn = false; o.vision = false;
     o.mtp = false; o.cache = 2; o.loopback = true; o.cacheDir = dirJoin(g_here, L"prompt-cache");
     std::wstring args, err;

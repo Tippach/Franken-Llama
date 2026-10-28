@@ -157,8 +157,12 @@ $bat = Get-Content (Join-Path $launch 'strix.bat') -Raw
 if ($bat -notmatch 'spec-draft-p-min 0\.30') { Fail 'bat p_min not 0.30' }
 if ($bat -notmatch 'spec-draft-n-max 3')     { Fail 'bat dmax not 3' }
 if ($bat -notmatch '(?m)^\s*if not defined LATIN set "LATIN=1"') { Fail 'bat does not default LATIN=1' }
-if ($bat -notmatch 'set "MTP=unsloth/Qwen3\.8-Flash-Next-GGUF"') { Fail 'bat does not default the draft to HF' }
-if ($bat -notmatch 'MTP_FILE=MTP/mtp-Qwen3\.8-Flash-Next-shared-Q4_K_M\.gguf') { Fail 'bat does not name the shared draft file' }
+if ($bat -notmatch 'set "MODEL=Rulith/Qwen3\.8-Flash-Next-Rulith-EXL3-GGUF:EXL3-4\.05bpw"') { Fail 'bat does not default MODEL to the EXL3 checkpoint' }
+if ($bat -notmatch 'set "MTP=Rulith/Qwen3\.8-Flash-Next-Rulith-EXL3-GGUF"') { Fail 'bat does not default the draft to the EXL3 repo' }
+if ($bat -notmatch 'MTP_FILE=mtp-Qwen3\.8-Flash-Next-lr512-ownhead\.gguf') { Fail 'bat does not name the own-head draft file' }
+# The own-head draft has no d2t map, so the trim must be FORCE-disabled for it or the server refuses
+# to start. A bat that drops this guard ships a default that cannot launch.
+if ($bat -notmatch 'MTP_FILE:ownhead=') { Fail 'bat has no own-head draft guard for LATIN' }
 if ($bat -notmatch '--spec-draft-vocab-latin') { Fail 'bat does not enforce the trim' }
 if ($bat -match '\\draft\\') { Fail 'bat references a bundled draft\ path' }
 # exactly ONE prompt-cache-on-disk mechanism, default kv-chain (handles text AND image chats;
@@ -176,8 +180,9 @@ if ($bat -notmatch '--ctx-size %CTX%') { Fail 'bat does not pass --ctx-size %CTX
 # shipping default is two 512k slots (PARALLEL=2, CTX=524288) - the validated production shape
 if ($bat -notmatch '(?m)^\s*if not defined PARALLEL set "PARALLEL=2"') { Fail 'bat does not default PARALLEL=2' }
 if ($bat -notmatch '(?m)^\s*if not defined CTX set "CTX=524288"') { Fail 'bat does not default CTX=524288' }
-# KVQ8 knob: default ON, and it must actually emit the four q8_0 cache flags
-if ($bat -notmatch '(?m)^\s*if not defined KVQ8 set "KVQ8=1"') { Fail 'bat does not default KVQ8=1' }
+# KVQ8 knob: default OFF (the shipping checkpoint fits with an unquantized cache), and the KVQ8=1
+# arm must still emit the four q8_0 cache flags when a user asks for them.
+if ($bat -notmatch '(?m)^\s*if not defined KVQ8 set "KVQ8=0"') { Fail 'bat does not default KVQ8=0' }
 if ($bat -notmatch '-ctk q8_0 -ctv q8_0 -ctkd q8_0 -ctvd q8_0') { Fail 'bat KVQ8 arm does not emit the q8_0 cache flags' }
 # the kv-chain (shipping) arm runs with the server's default RAM cache: PC_ARGS is seeded by
 # --kv-chain-dir, not by --cache-ram 0 (only the CACHE=off arm may still disable the RAM cache)
@@ -197,7 +202,17 @@ $gp = Start-Process -FilePath $gui -ArgumentList '--selftest' -Wait -NoNewWindow
 $guiTxt = if (Test-Path $guiTmp) { Get-Content -LiteralPath $guiTmp -Raw } else { '' }
 Remove-Item $guiTmp, (Join-Path $env:TEMP 'fl_selftest_err.txt') -Force -EA SilentlyContinue
 if ($gp.ExitCode -ne 0) { Fail ("strix_gui.exe --selftest exit $($gp.ExitCode) : " + ($guiTxt -replace "`n", ' / ')) }
-foreach ($needle in 'UD-IQ4_XS', 'ISTA', '--kv-chain-dir', 'network no-key allowed: yes ; with-key passes --api-key: yes') {
+# same needle set as baseline package/build_package.ps1 - the two gates stay coupled on purpose.
+# strix_gui.cpp is copied verbatim from baseline, so its --selftest output is byte-identical here.
+foreach ($needle in 'UD-IQ4_XS', 'ISTA', 'Swift-1.5-Qwen3.8-Flash-Next-GGUF:IQ4_XS',
+                    'huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-v2-GGUF:UD-IQ4_XS',
+                    'Rulith/Qwen3.8-Flash-Next-Rulith-EXL3-GGUF:EXL3-4.05bpw',
+                    'mtp-Qwen3.8-Flash-Next-lr512-ownhead.gguf', '--kv-chain-dir',
+                    'template policy (embedded checkpoints omit --chat-template-file): yes',
+                    'latin policy (own-head-draft checkpoints omit --spec-draft-vocab-latin): yes',
+                    'default kv unquantized: yes ; default checkpoint in default args: yes',
+                    'default checkpoint: EXL3 4.05bpw  (shipping default)',
+                    'network no-key allowed: yes ; with-key passes --api-key: yes') {
     if ($guiTxt -notmatch [regex]::Escape($needle)) { Fail "strix_gui.exe --selftest output missing '$needle'" }
 }
 Write-Host 'launcher guards: PASS (strix_gui.exe --selftest)'
